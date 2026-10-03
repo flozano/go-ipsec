@@ -25,15 +25,14 @@ type suiteID interface {
 
 // transformSuite describes one negotiable transform suite for either layer: the
 // wire transforms it is offered and matched by, and the per-direction KEYMAT
-// lengths internal/ikesa derives for it. protocol selects the layer (ESP or
-// IKE), which governs the only structural differences between the two — an IKE
-// proposal carries a PRF transform and an 8-byte SPI, an ESP proposal an ESN
-// transform and a 4-byte SPI. The espSuite/ikeSuite aliases below pin the id
-// type per layer.
+// lengths internal/ikesa derives for it. The layer (ESP or IKE) is fixed by the
+// ID type parameter (see protocol), which governs the only structural
+// differences between the two — an IKE proposal carries a PRF transform and an
+// 8-byte SPI, an ESP proposal an ESN transform and a 4-byte SPI. The
+// espSuite/ikeSuite aliases below pin the id type per layer.
 type transformSuite[ID suiteID] struct {
-	id       ID
-	protocol ikemsg.ProtocolID
-	encrID   uint16 // ENCR transform ID
+	id     ID
+	encrID uint16 // ENCR transform ID
 	// keyBits is the Key Length attribute value on the ENCR transform; 0 means
 	// the attribute is ABSENT (ChaCha20-Poly1305, RFC 7634 §2 — its key size is
 	// implicit and a peer must not attach the attribute). Matching is strict in
@@ -49,7 +48,7 @@ type transformSuite[ID suiteID] struct {
 
 // espSuite / ikeSuite pin transformSuite to each layer's Suite enum. They are
 // aliases, so the id field, key lengths and helper methods are shared; only the
-// id type and the protocol field differ.
+// id type (and with it the protocol) differs.
 type (
 	espSuite = transformSuite[esp.Suite]
 	ikeSuite = transformSuite[ikesa.Suite]
@@ -58,13 +57,28 @@ type (
 // name returns the suite's diagnostic name (shared with the Suite.String impls).
 func (s transformSuite[ID]) name() string { return s.id.String() }
 
+// protocol returns the IKE protocol the suite's layer negotiates, derived from
+// the ID type so a table row cannot disagree with its layer: ProtocolESP for an
+// esp.Suite row, ProtocolIKE for an ikesa.Suite row. Any other ID type is a
+// programming error (the suiteID constraint cannot name the two types exactly).
+func (s transformSuite[ID]) protocol() ikemsg.ProtocolID {
+	switch any(s.id).(type) {
+	case esp.Suite:
+		return ikemsg.ProtocolESP
+	case ikesa.Suite:
+		return ikemsg.ProtocolIKE
+	default:
+		panic(fmt.Sprintf("session: transformSuite with unsupported id type %T", s.id))
+	}
+}
+
 // aead reports whether the suite is a combined-mode (AEAD) cipher.
 func (s transformSuite[ID]) aead() bool { return s.integID == 0 }
 
 // spiLen is the SPI size the suite's protocol carries in a proposal: 8 bytes for
 // an IKE SA, 4 for an ESP Child SA (RFC 7296 §3.3.1).
 func (s transformSuite[ID]) spiLen() int {
-	if s.protocol == ikemsg.ProtocolIKE {
+	if s.protocol() == ikemsg.ProtocolIKE {
 		return 8
 	}
 	return 4
@@ -74,9 +88,9 @@ func (s transformSuite[ID]) spiLen() int {
 // AES-256-GCM-16 (hardware-accelerated single pass), ChaCha20-Poly1305 (fast
 // without AES-NI), then the RFC-MUST AES-CBC-256 + HMAC-SHA2-256-128.
 var espSuites = []espSuite{
-	{id: esp.SuiteAESGCM256, protocol: ikemsg.ProtocolESP, encrID: ikemsg.ENCR_AES_GCM_16, keyBits: keyLenAES256, encrKeyLen: 36},
-	{id: esp.SuiteChaCha20Poly1305, protocol: ikemsg.ProtocolESP, encrID: ikemsg.ENCR_CHACHA20_POLY1305, encrKeyLen: 36},
-	{id: esp.SuiteAESCBC256SHA256, protocol: ikemsg.ProtocolESP, encrID: ikemsg.ENCR_AES_CBC, keyBits: keyLenAES256, encrKeyLen: 32,
+	{id: esp.SuiteAESGCM256, encrID: ikemsg.ENCR_AES_GCM_16, keyBits: keyLenAES256, encrKeyLen: 36},
+	{id: esp.SuiteChaCha20Poly1305, encrID: ikemsg.ENCR_CHACHA20_POLY1305, encrKeyLen: 36},
+	{id: esp.SuiteAESCBC256SHA256, encrID: ikemsg.ENCR_AES_CBC, keyBits: keyLenAES256, encrKeyLen: 32,
 		integID: ikemsg.AUTH_HMAC_SHA2_256_128, integKeyLen: 32},
 }
 
@@ -87,9 +101,9 @@ var espSuites = []espSuite{
 // also drives the AUTH signed octets), so only the encryption transform is
 // negotiable.
 var ikeSuites = []ikeSuite{
-	{id: ikesa.SuiteAESGCM256, protocol: ikemsg.ProtocolIKE, encrID: ikemsg.ENCR_AES_GCM_16, keyBits: keyLenAES256, encrKeyLen: 36},
-	{id: ikesa.SuiteChaCha20Poly1305, protocol: ikemsg.ProtocolIKE, encrID: ikemsg.ENCR_CHACHA20_POLY1305, encrKeyLen: 36},
-	{id: ikesa.SuiteAESCBC256SHA256, protocol: ikemsg.ProtocolIKE, encrID: ikemsg.ENCR_AES_CBC, keyBits: keyLenAES256, encrKeyLen: 32,
+	{id: ikesa.SuiteAESGCM256, encrID: ikemsg.ENCR_AES_GCM_16, keyBits: keyLenAES256, encrKeyLen: 36},
+	{id: ikesa.SuiteChaCha20Poly1305, encrID: ikemsg.ENCR_CHACHA20_POLY1305, encrKeyLen: 36},
+	{id: ikesa.SuiteAESCBC256SHA256, encrID: ikemsg.ENCR_AES_CBC, keyBits: keyLenAES256, encrKeyLen: 32,
 		integID: ikemsg.AUTH_HMAC_SHA2_256_128, integKeyLen: 32},
 }
 
@@ -103,13 +117,10 @@ func suiteByID[ID suiteID](id ID, table []transformSuite[ID]) (transformSuite[ID
 	return transformSuite[ID]{}, false
 }
 
-// espSuiteByID / ikeSuiteByID return the table row for a layer suite id.
-func espSuiteByID(id esp.Suite) (espSuite, bool)   { return suiteByID(id, espSuites) }
-func ikeSuiteByID(id ikesa.Suite) (ikeSuite, bool) { return suiteByID(id, ikeSuites) }
-
 // enabledSuites maps a Config suite-id list into table rows, preserving the
 // caller's preference order; nil/empty enables the full table in its built-in
-// order. Unknown ids are skipped (the public config layer validates them).
+// order. Unknown ids are skipped here; checkSuites rejects them up front (at
+// IKESAInit) so a skipped id can never shrink an offer silently.
 func enabledSuites[ID suiteID](configured []ID, table []transformSuite[ID]) []transformSuite[ID] {
 	if len(configured) == 0 {
 		return table
@@ -121,6 +132,29 @@ func enabledSuites[ID suiteID](configured []ID, table []transformSuite[ID]) []tr
 		}
 	}
 	return out
+}
+
+// checkSuites reports an error for any configured id that has no row in the
+// layer's table. The public config layer validates against its own mapper, so
+// this is the backstop for a mapper/table drift (a new Suite mapped but never
+// added to the table) or a session.Config built directly with a bogus id —
+// either would otherwise drop the id silently, or offer an empty SA payload.
+func checkSuites[ID suiteID](layer string, configured []ID, table []transformSuite[ID]) error {
+	for _, id := range configured {
+		if _, ok := suiteByID(id, table); !ok {
+			return fmt.Errorf("session: %s suite %v has no negotiation table entry", layer, id)
+		}
+	}
+	return nil
+}
+
+// checkConfiguredSuites validates Config.ESPSuites / IKESuites against the
+// built-in tables (see checkSuites).
+func (s *Session) checkConfiguredSuites() error {
+	if err := checkSuites("ESP", s.cfg.ESPSuites, espSuites); err != nil {
+		return err
+	}
+	return checkSuites("IKE", s.cfg.IKESuites, ikeSuites)
 }
 
 // enabledESPSuites / enabledIKESuites resolve the session's configured suite
@@ -137,7 +171,7 @@ func (s *Session) enabledIKESuites() []ikeSuite { return enabledSuites(s.cfg.IKE
 func buildProposalForSuite[ID suiteID](number uint8, s transformSuite[ID], spi []byte, groups ...uint16) ikemsg.Proposal {
 	p := ikemsg.Proposal{
 		Number:   number,
-		Protocol: s.protocol,
+		Protocol: s.protocol(),
 		Transforms: []ikemsg.Transform{
 			{Type: ikemsg.TransformEncr, ID: s.encrID, KeyLength: s.keyBits, HasKeyLength: s.keyBits != 0},
 		},
@@ -145,7 +179,7 @@ func buildProposalForSuite[ID suiteID](number uint8, s transformSuite[ID], spi [
 	if len(spi) > 0 {
 		p.SPI = append([]byte(nil), spi...)
 	}
-	if s.protocol == ikemsg.ProtocolIKE {
+	if s.protocol() == ikemsg.ProtocolIKE {
 		p.Transforms = append(p.Transforms, ikemsg.Transform{Type: ikemsg.TransformPRF, ID: ikemsg.PRF_HMAC_SHA2_256})
 	}
 	if !s.aead() {
@@ -154,7 +188,7 @@ func buildProposalForSuite[ID suiteID](number uint8, s transformSuite[ID], spi [
 	for _, g := range groups {
 		p.Transforms = append(p.Transforms, ikemsg.Transform{Type: ikemsg.TransformDH, ID: g})
 	}
-	if s.protocol == ikemsg.ProtocolESP {
+	if s.protocol() == ikemsg.ProtocolESP {
 		p.Transforms = append(p.Transforms, ikemsg.Transform{Type: ikemsg.TransformESN, ID: ikemsg.ESN_NONE})
 	}
 	return p
@@ -172,33 +206,6 @@ func buildProposals[ID suiteID](spi []byte, suites []transformSuite[ID], groups 
 		props = append(props, buildProposalForSuite(uint8(i+1), s, spi, groups...))
 	}
 	return props
-}
-
-// buildESPProposalForSuite / buildIKEProposalForSuite build one proposal for the
-// named layer. buildIKEProposalForSuite passes spi=nil for IKE_SA_INIT and the
-// 8-byte IKE SPI for CREATE_CHILD_SA rekeys.
-func buildESPProposalForSuite(number uint8, s espSuite, spi []byte, groups ...uint16) ikemsg.Proposal {
-	return buildProposalForSuite(number, s, spi, groups...)
-}
-
-func buildIKEProposalForSuite(number uint8, s ikeSuite, spi []byte, groups ...uint16) ikemsg.Proposal {
-	return buildProposalForSuite(number, s, spi, groups...)
-}
-
-// buildESPProposals returns one ESP proposal per enabled suite carrying the given
-// 4-byte SPI. buildIKEProposals is the IKE_SA_INIT variant (no SPI) and
-// buildIKEProposalsSPI the CREATE_CHILD_SA (IKE rekey) variant carrying the new
-// 8-byte IKE SPI on every proposal.
-func buildESPProposals(spi []byte, suites []espSuite, groups ...uint16) []ikemsg.Proposal {
-	return buildProposals(spi, suites, groups...)
-}
-
-func buildIKEProposals(suites []ikeSuite, groups ...uint16) []ikemsg.Proposal {
-	return buildProposals(nil, suites, groups...)
-}
-
-func buildIKEProposalsSPI(spi []byte, suites []ikeSuite, groups ...uint16) []ikemsg.Proposal {
-	return buildProposals(spi, suites, groups...)
 }
 
 // hasTransform reports whether the offered transforms include one with the given
@@ -239,14 +246,14 @@ func hasTransform(ts []ikemsg.Transform, id uint16, keyLen *uint16) bool {
 // PRF; an ESP proposal the (No-)ESN transform. The DH group is checked
 // separately by the callers — the constraint differs per exchange.
 func suiteMatches[ID suiteID](s transformSuite[ID], p ikemsg.Proposal) bool {
-	if p.Protocol != s.protocol {
+	if p.Protocol != s.protocol() {
 		return false
 	}
 	keyBits := s.keyBits
 	if !hasTransform(p.ByType(ikemsg.TransformEncr), s.encrID, &keyBits) {
 		return false
 	}
-	if s.protocol == ikemsg.ProtocolIKE &&
+	if s.protocol() == ikemsg.ProtocolIKE &&
 		!hasTransform(p.ByType(ikemsg.TransformPRF), ikemsg.PRF_HMAC_SHA2_256, nil) {
 		return false
 	}
@@ -258,30 +265,32 @@ func suiteMatches[ID suiteID](s transformSuite[ID], p ikemsg.Proposal) bool {
 	} else if !hasTransform(integs, s.integID, nil) {
 		return false
 	}
-	if s.protocol == ikemsg.ProtocolESP &&
+	if s.protocol() == ikemsg.ProtocolESP &&
 		!hasTransform(p.ByType(ikemsg.TransformESN), ikemsg.ESN_NONE, nil) {
 		return false
 	}
 	return true
 }
 
-// suiteMatchesProposal / ikeSuiteMatchesProposal are the ESP/IKE facades over
-// suiteMatches (presence semantics for a possibly-multi-alternative proposal).
-func suiteMatchesProposal(s espSuite, p ikemsg.Proposal) bool    { return suiteMatches(s, p) }
-func ikeSuiteMatchesProposal(s ikeSuite, p ikemsg.Proposal) bool { return suiteMatches(s, p) }
-
 // isSelectionFor reports whether p is a valid narrowed responder SELECTION of the
 // suite: beyond suiteMatches (presence among possibly-many offered alternatives)
-// it requires exactly one ENCR transform and an unambiguous integrity type —
-// none or a single AUTH_NONE for an AEAD suite, exactly one HMAC otherwise — and,
-// for IKE, exactly one PRF. The selected suite fixes the KEYMAT/SKEYSEED split,
-// so an ambiguous "selection" would leave the key schedule undefined (RFC 7296
-// §2.7).
+// it requires exactly one ENCR transform, an unambiguous integrity type — none
+// or a single AUTH_NONE for an AEAD suite, exactly one HMAC otherwise — at most
+// one DH transform, and, for IKE, exactly one PRF, for ESP exactly one ESN
+// transform. The selected suite fixes the KEYMAT/SKEYSEED split and the
+// sequence-number width, so an ambiguous "selection" would leave the key
+// schedule or the data plane undefined (RFC 7296 §2.7).
 func isSelectionFor[ID suiteID](s transformSuite[ID], p ikemsg.Proposal) bool {
 	if !suiteMatches(s, p) || len(p.ByType(ikemsg.TransformEncr)) != 1 {
 		return false
 	}
-	if s.protocol == ikemsg.ProtocolIKE && len(p.ByType(ikemsg.TransformPRF)) != 1 {
+	if len(p.ByType(ikemsg.TransformDH)) > 1 {
+		return false
+	}
+	if s.protocol() == ikemsg.ProtocolIKE && len(p.ByType(ikemsg.TransformPRF)) != 1 {
+		return false
+	}
+	if s.protocol() == ikemsg.ProtocolESP && len(p.ByType(ikemsg.TransformESN)) != 1 {
 		return false
 	}
 	integs := p.ByType(ikemsg.TransformInteg)
@@ -305,15 +314,6 @@ func selectedSuite[ID suiteID](p ikemsg.Proposal, enabled []transformSuite[ID]) 
 	return transformSuite[ID]{}, false
 }
 
-// selectedESPSuite / selectedIKESuite are the ESP/IKE facades over selectedSuite.
-func selectedESPSuite(p ikemsg.Proposal, enabled []espSuite) (espSuite, bool) {
-	return selectedSuite(p, enabled)
-}
-
-func selectedIKESuite(p ikemsg.Proposal, enabled []ikeSuite) (ikeSuite, bool) {
-	return selectedSuite(p, enabled)
-}
-
 // selectProposal picks from a peer-initiated offer: the first enabled suite (in
 // OUR preference order) that some offered proposal advertises with the protocol's
 // SPI size, together with that proposal. requireGroup, when non-zero,
@@ -333,16 +333,6 @@ func selectProposal[ID suiteID](sa *ikemsg.SAPayload, enabled []transformSuite[I
 		}
 	}
 	return ikemsg.Proposal{}, transformSuite[ID]{}, false
-}
-
-// selectESPProposal / selectIKEProposal are the ESP/IKE facades over
-// selectProposal (SPI length 4 vs 8 comes from the suite's protocol).
-func selectESPProposal(sa *ikemsg.SAPayload, enabled []espSuite, requireGroup uint16) (ikemsg.Proposal, espSuite, bool) {
-	return selectProposal(sa, enabled, requireGroup)
-}
-
-func selectIKEProposal(sa *ikemsg.SAPayload, enabled []ikeSuite, requireGroup uint16) (ikemsg.Proposal, ikeSuite, bool) {
-	return selectProposal(sa, enabled, requireGroup)
 }
 
 // preferredDHGroups lists the DH groups internal/ikesa can run, most-preferred

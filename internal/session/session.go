@@ -194,6 +194,9 @@ const network = "udp"
 // is the first step of Dial; subsequent steps (IKE_AUTH) reuse the derived
 // state and the stored verbatim datagrams.
 func (s *Session) IKESAInit(ctx context.Context) error {
+	if err := s.checkConfiguredSuites(); err != nil {
+		return err
+	}
 	if s.conn == nil {
 		conn, err := transport.DialUDP(ctx, s.cfg.Dialer, network, withDefaultPort(s.cfg.Server))
 		if err != nil {
@@ -326,7 +329,7 @@ func (s *Session) buildSAInit(cookie []byte) (*ikemsg.Message, []byte, error) {
 	// (x25519 preferred, MODP-2048 fallback); the KE carries our current group,
 	// which the INVALID_KE_PAYLOAD retry may switch.
 	m.Payloads = append(m.Payloads,
-		&ikemsg.SAPayload{Proposals: buildIKEProposals(s.enabledIKESuites(), ikemsg.DH_X25519, ikemsg.DH_MODP2048)},
+		&ikemsg.SAPayload{Proposals: buildProposals(nil, s.enabledIKESuites(), ikemsg.DH_X25519, ikemsg.DH_MODP2048)},
 		&ikemsg.KEPayload{Group: s.dh.Group, Data: s.dh.Public},
 		&ikemsg.NoncePayload{Data: s.nonceI},
 	)
@@ -383,7 +386,7 @@ func (s *Session) handleSAInitResponse(raw []byte) error {
 				return errors.New("session: IKE_SA_INIT response carries no proposal")
 			}
 			var ok bool
-			if suite, ok = selectedIKESuite(payload.Proposals[0], s.enabledIKESuites()); !ok {
+			if suite, ok = selectedSuite(payload.Proposals[0], s.enabledIKESuites()); !ok {
 				return fmt.Errorf("session: responder selected an unsupported or ambiguous IKE proposal (%s)", describeProposals(payload))
 			}
 			// The responder's narrowed proposal must carry the same DH group as our

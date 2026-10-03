@@ -19,7 +19,7 @@ const (
 // mustSuite returns the suite-table row for an esp.Suite id.
 func mustSuite(t *testing.T, id esp.Suite) espSuite {
 	t.Helper()
-	s, ok := espSuiteByID(id)
+	s, ok := suiteByID(id, espSuites)
 	if !ok {
 		t.Fatalf("suite %v missing from the table", id)
 	}
@@ -29,7 +29,7 @@ func mustSuite(t *testing.T, id esp.Suite) espSuite {
 // mustIKESuite returns the IKE suite-table row for an ikesa.Suite id.
 func mustIKESuite(t *testing.T, id ikesa.Suite) ikeSuite {
 	t.Helper()
-	s, ok := ikeSuiteByID(id)
+	s, ok := suiteByID(id, ikeSuites)
 	if !ok {
 		t.Fatalf("IKE suite %v missing from the table", id)
 	}
@@ -39,8 +39,8 @@ func mustIKESuite(t *testing.T, id ikesa.Suite) ikeSuite {
 // buildESPProposalCBC builds the single-proposal AES-CBC-256 + HMAC-SHA2-256-128
 // offer used by scripted responders and legacy fixtures.
 func buildESPProposalCBC(number uint8, spi []byte, groups ...uint16) ikemsg.Proposal {
-	s, _ := espSuiteByID(esp.SuiteAESCBC256SHA256)
-	return buildESPProposalForSuite(number, s, spi, groups...)
+	s, _ := suiteByID(esp.SuiteAESCBC256SHA256, espSuites)
+	return buildProposalForSuite(number, s, spi, groups...)
 }
 
 // TestSAProposalRoundTrip encodes the full multi-suite IKE offer (one proposal
@@ -55,7 +55,7 @@ func TestSAProposalRoundTrip(t *testing.T) {
 		Exchange:     ikemsg.ExchangeIKESAInit,
 		Flags:        ikemsg.FlagInitiator,
 		Payloads: ikemsg.Payloads{
-			&ikemsg.SAPayload{Proposals: buildIKEProposals(ikeSuites, ikemsg.DH_X25519, ikemsg.DH_MODP2048)},
+			&ikemsg.SAPayload{Proposals: buildProposals(nil, ikeSuites, ikemsg.DH_X25519, ikemsg.DH_MODP2048)},
 			&ikemsg.NoncePayload{Data: bytes.Repeat([]byte{0xA5}, nonceLen)},
 		},
 	}
@@ -115,7 +115,7 @@ func TestSAProposalRoundTrip(t *testing.T) {
 		if len(prop.ByType(ikemsg.TransformESN)) != 0 {
 			t.Fatalf("proposal %d (%s): IKE proposal carries ESN", i, suite.name())
 		}
-		if !ikeSuiteMatchesProposal(suite, prop) {
+		if !suiteMatches(suite, prop) {
 			t.Fatalf("proposal %d (%s): does not match its own suite after round-trip", i, suite.name())
 		}
 	}
@@ -150,42 +150,42 @@ func TestIKESuiteMatchStrictness(t *testing.T) {
 	chacha := mustIKESuite(t, ikesa.SuiteChaCha20Poly1305)
 
 	// ChaCha with an (illegal) KeyLength attribute → no match for any suite.
-	p := buildIKEProposalForSuite(1, chacha, nil)
+	p := buildProposalForSuite(1, chacha, nil)
 	p.Transforms[0].KeyLength = 256
 	p.Transforms[0].HasKeyLength = true
 	for _, s := range ikeSuites {
-		if ikeSuiteMatchesProposal(s, p) {
+		if suiteMatches(s, p) {
 			t.Fatalf("%s matched a ChaCha transform carrying a Key Length attribute", s.name())
 		}
 	}
 
 	// GCM with a 128-bit Key Length → no match (we only run GCM-256).
-	p = buildIKEProposalForSuite(1, gcm, nil)
+	p = buildProposalForSuite(1, gcm, nil)
 	p.Transforms[0].KeyLength = 128
 	for _, s := range ikeSuites {
-		if ikeSuiteMatchesProposal(s, p) {
+		if suiteMatches(s, p) {
 			t.Fatalf("%s matched a GCM-128 transform", s.name())
 		}
 	}
 
 	// A proposal without a PRF cannot match (the PRF drives the key schedule).
-	p = buildIKEProposalForSuite(1, gcm, nil)
+	p = buildProposalForSuite(1, gcm, nil)
 	p.Transforms = p.Transforms[:1] // drop the PRF
-	if ikeSuiteMatchesProposal(gcm, p) {
+	if suiteMatches(gcm, p) {
 		t.Fatal("GCM matched a proposal with no PRF transform")
 	}
 
 	// An AEAD proposal whose only integrity options are real algorithms cannot
 	// be narrowed to the AEAD suite (RFC 7296 §3.3.3).
-	p = buildIKEProposalForSuite(1, gcm, nil)
+	p = buildProposalForSuite(1, gcm, nil)
 	p.Transforms = append(p.Transforms, ikemsg.Transform{Type: ikemsg.TransformInteg, ID: ikemsg.AUTH_HMAC_SHA2_256_128})
-	if ikeSuiteMatchesProposal(gcm, p) {
+	if suiteMatches(gcm, p) {
 		t.Fatal("GCM matched a proposal whose only INTEG option is a real algorithm")
 	}
 
 	// ...but an explicit AUTH_NONE among the alternatives is selectable.
 	p.Transforms = append(p.Transforms, ikemsg.Transform{Type: ikemsg.TransformInteg, ID: ikemsg.AUTH_NONE})
-	if !ikeSuiteMatchesProposal(gcm, p) {
+	if !suiteMatches(gcm, p) {
 		t.Fatal("GCM did not match a proposal offering AUTH_NONE among the INTEG alternatives")
 	}
 }
@@ -198,33 +198,33 @@ func TestSelectedIKESuiteAmbiguityRejected(t *testing.T) {
 	gcm := mustIKESuite(t, ikesa.SuiteAESGCM256)
 	chacha := mustIKESuite(t, ikesa.SuiteChaCha20Poly1305)
 
-	twoENCR := buildIKEProposalForSuite(1, gcm, nil)
+	twoENCR := buildProposalForSuite(1, gcm, nil)
 	twoENCR.Transforms = append(twoENCR.Transforms,
 		ikemsg.Transform{Type: ikemsg.TransformEncr, ID: ikemsg.ENCR_CHACHA20_POLY1305})
-	if _, ok := selectedIKESuite(twoENCR, ikeSuites); ok {
+	if _, ok := selectedSuite(twoENCR, ikeSuites); ok {
 		t.Fatal("an ambiguous two-ENCR selection was accepted")
 	}
 
-	twoPRF := buildIKEProposalForSuite(1, gcm, nil)
+	twoPRF := buildProposalForSuite(1, gcm, nil)
 	twoPRF.Transforms = append(twoPRF.Transforms,
 		ikemsg.Transform{Type: ikemsg.TransformPRF, ID: 7 /* PRF_HMAC_SHA2_512 */})
-	if _, ok := selectedIKESuite(twoPRF, ikeSuites); ok {
+	if _, ok := selectedSuite(twoPRF, ikeSuites); ok {
 		t.Fatal("an ambiguous two-PRF selection was accepted")
 	}
 
-	clean := buildIKEProposalForSuite(2, chacha, nil)
-	s, ok := selectedIKESuite(clean, ikeSuites)
+	clean := buildProposalForSuite(2, chacha, nil)
+	s, ok := selectedSuite(clean, ikeSuites)
 	if !ok || s.id != ikesa.SuiteChaCha20Poly1305 {
 		t.Fatalf("clean ChaCha selection mapped to %v, ok=%v", s.id, ok)
 	}
 	// A selection of a suite that is not enabled must be rejected.
-	if _, ok := selectedIKESuite(clean, []ikeSuite{mustIKESuite(t, ikesa.SuiteAESCBC256SHA256)}); ok {
+	if _, ok := selectedSuite(clean, []ikeSuite{mustIKESuite(t, ikesa.SuiteAESCBC256SHA256)}); ok {
 		t.Fatal("a selection of a disabled suite was accepted")
 	}
 	// An AEAD selection with a single explicit AUTH_NONE INTEG is valid.
-	withNone := buildIKEProposalForSuite(1, gcm, nil)
+	withNone := buildProposalForSuite(1, gcm, nil)
 	withNone.Transforms = append(withNone.Transforms, ikemsg.Transform{Type: ikemsg.TransformInteg, ID: ikemsg.AUTH_NONE})
-	if s, ok := selectedIKESuite(withNone, ikeSuites); !ok || s.id != ikesa.SuiteAESGCM256 {
+	if s, ok := selectedSuite(withNone, ikeSuites); !ok || s.id != ikesa.SuiteAESGCM256 {
 		t.Fatal("an AEAD selection with an explicit AUTH_NONE was rejected")
 	}
 }
@@ -239,37 +239,37 @@ func TestSelectIKEProposalPreference(t *testing.T) {
 	spi := bytes.Repeat([]byte{0xA1}, 8)
 
 	offer := &ikemsg.SAPayload{Proposals: []ikemsg.Proposal{
-		buildIKEProposalForSuite(1, cbc, spi, ikemsg.DH_MODP2048),
-		buildIKEProposalForSuite(2, gcm, spi, ikemsg.DH_MODP2048),
+		buildProposalForSuite(1, cbc, spi, ikemsg.DH_MODP2048),
+		buildProposalForSuite(2, gcm, spi, ikemsg.DH_MODP2048),
 	}}
-	p, s, ok := selectIKEProposal(offer, ikeSuites, 0)
+	p, s, ok := selectProposal(offer, ikeSuites, 0)
 	if !ok || s.id != ikesa.SuiteAESGCM256 || p.Number != 2 {
 		t.Fatalf("full table: picked %v #%d, want GCM #2", s.id, p.Number)
 	}
-	p, s, ok = selectIKEProposal(offer, []ikeSuite{cbc}, 0)
+	p, s, ok = selectProposal(offer, []ikeSuite{cbc}, 0)
 	if !ok || s.id != ikesa.SuiteAESCBC256SHA256 || p.Number != 1 {
 		t.Fatalf("CBC-only: picked %v #%d, want CBC #1", s.id, p.Number)
 	}
-	if _, _, ok := selectIKEProposal(offer, []ikeSuite{mustIKESuite(t, ikesa.SuiteChaCha20Poly1305)}, 0); ok {
+	if _, _, ok := selectProposal(offer, []ikeSuite{mustIKESuite(t, ikesa.SuiteChaCha20Poly1305)}, 0); ok {
 		t.Fatal("ChaCha-only matched an offer with no ChaCha proposal")
 	}
 
 	// A proposal without the 8-byte rekey SPI is not selectable.
-	noSPI := &ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildIKEProposalForSuite(1, gcm, nil, ikemsg.DH_MODP2048)}}
-	if _, _, ok := selectIKEProposal(noSPI, ikeSuites, 0); ok {
+	noSPI := &ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildProposalForSuite(1, gcm, nil, ikemsg.DH_MODP2048)}}
+	if _, _, ok := selectProposal(noSPI, ikeSuites, 0); ok {
 		t.Fatal("a proposal without an 8-byte SPI was selected for an IKE rekey")
 	}
 
 	// requireGroup: the GCM proposal lacks the group → fall back to CBC.
 	grouped := &ikemsg.SAPayload{Proposals: []ikemsg.Proposal{
-		buildIKEProposalForSuite(1, gcm, spi), // no DH group
-		buildIKEProposalForSuite(2, cbc, spi, ikemsg.DH_MODP2048),
+		buildProposalForSuite(1, gcm, spi), // no DH group
+		buildProposalForSuite(2, cbc, spi, ikemsg.DH_MODP2048),
 	}}
-	p, s, ok = selectIKEProposal(grouped, ikeSuites, ikemsg.DH_MODP2048)
+	p, s, ok = selectProposal(grouped, ikeSuites, ikemsg.DH_MODP2048)
 	if !ok || s.id != ikesa.SuiteAESCBC256SHA256 || p.Number != 2 {
 		t.Fatalf("requireGroup: picked %v #%d, want CBC #2", s.id, p.Number)
 	}
-	if _, _, ok := selectIKEProposal(grouped, ikeSuites, ikemsg.DH_X25519); ok {
+	if _, _, ok := selectProposal(grouped, ikeSuites, ikemsg.DH_X25519); ok {
 		t.Fatal("matched despite no proposal advertising the required group")
 	}
 }
@@ -287,7 +287,7 @@ func TestESPProposalsRoundTrip(t *testing.T) {
 		Flags:     ikemsg.FlagInitiator,
 		MessageID: 1,
 		Payloads: ikemsg.Payloads{
-			&ikemsg.SAPayload{Proposals: buildESPProposals(spi, espSuites, ikemsg.DH_X25519)},
+			&ikemsg.SAPayload{Proposals: buildProposals(spi, espSuites, ikemsg.DH_X25519)},
 		},
 	}
 
@@ -341,7 +341,7 @@ func TestESPProposalsRoundTrip(t *testing.T) {
 		if !hasTransform(prop.ByType(ikemsg.TransformESN), ikemsg.ESN_NONE, nil) {
 			t.Fatalf("proposal %d (%s): missing ESN None", i, suite.name())
 		}
-		if !suiteMatchesProposal(suite, prop) {
+		if !suiteMatches(suite, prop) {
 			t.Fatalf("proposal %d (%s): does not match its own suite after round-trip", i, suite.name())
 		}
 	}
@@ -357,45 +357,45 @@ func TestSuiteMatchStrictness(t *testing.T) {
 	spi := []byte{1, 2, 3, 4}
 
 	// ChaCha with an (illegal) KeyLength attribute → no match for any suite.
-	p := buildESPProposalForSuite(1, chacha, spi)
+	p := buildProposalForSuite(1, chacha, spi)
 	p.Transforms[0].KeyLength = 256
 	p.Transforms[0].HasKeyLength = true
 	for _, s := range espSuites {
-		if suiteMatchesProposal(s, p) {
+		if suiteMatches(s, p) {
 			t.Fatalf("%s matched a ChaCha transform carrying a Key Length attribute", s.name())
 		}
 	}
 	// Even an explicit KEY_LENGTH=0 must be rejected: ChaCha requires the
 	// attribute to be absent, not present-with-zero.
-	p = buildESPProposalForSuite(1, chacha, spi)
+	p = buildProposalForSuite(1, chacha, spi)
 	p.Transforms[0].HasKeyLength = true
 	for _, s := range espSuites {
-		if suiteMatchesProposal(s, p) {
+		if suiteMatches(s, p) {
 			t.Fatalf("%s matched a ChaCha transform carrying an explicit zero Key Length attribute", s.name())
 		}
 	}
 
 	// GCM with a 128-bit Key Length → no match (we only run GCM-256).
-	p = buildESPProposalForSuite(1, gcm, spi)
+	p = buildProposalForSuite(1, gcm, spi)
 	p.Transforms[0].KeyLength = 128
 	p.Transforms[0].HasKeyLength = true
 	for _, s := range espSuites {
-		if suiteMatchesProposal(s, p) {
+		if suiteMatches(s, p) {
 			t.Fatalf("%s matched a GCM-128 transform", s.name())
 		}
 	}
 
 	// An AEAD proposal whose only integrity options are real algorithms cannot
 	// be narrowed to the AEAD suite (RFC 7296 §3.3.3).
-	p = buildESPProposalForSuite(1, gcm, spi)
+	p = buildProposalForSuite(1, gcm, spi)
 	p.Transforms = append(p.Transforms, ikemsg.Transform{Type: ikemsg.TransformInteg, ID: ikemsg.AUTH_HMAC_SHA2_256_128})
-	if suiteMatchesProposal(gcm, p) {
+	if suiteMatches(gcm, p) {
 		t.Fatal("GCM matched a proposal whose only INTEG option is a real algorithm")
 	}
 
 	// ...but an explicit AUTH_NONE among the alternatives is selectable.
 	p.Transforms = append(p.Transforms, ikemsg.Transform{Type: ikemsg.TransformInteg, ID: ikemsg.AUTH_NONE})
-	if !suiteMatchesProposal(gcm, p) {
+	if !suiteMatches(gcm, p) {
 		t.Fatal("GCM did not match a proposal offering AUTH_NONE among the INTEG alternatives")
 	}
 }
@@ -408,26 +408,26 @@ func TestSelectedESPSuiteAmbiguityRejected(t *testing.T) {
 	chacha := mustSuite(t, esp.SuiteChaCha20Poly1305)
 	spi := []byte{1, 2, 3, 4}
 
-	ambiguous := buildESPProposalForSuite(1, gcm, spi)
+	ambiguous := buildProposalForSuite(1, gcm, spi)
 	ambiguous.Transforms = append(ambiguous.Transforms,
 		ikemsg.Transform{Type: ikemsg.TransformEncr, ID: ikemsg.ENCR_CHACHA20_POLY1305})
-	if _, ok := selectedESPSuite(ambiguous, espSuites); ok {
+	if _, ok := selectedSuite(ambiguous, espSuites); ok {
 		t.Fatal("an ambiguous two-ENCR selection was accepted")
 	}
 
-	clean := buildESPProposalForSuite(2, chacha, spi)
-	s, ok := selectedESPSuite(clean, espSuites)
+	clean := buildProposalForSuite(2, chacha, spi)
+	s, ok := selectedSuite(clean, espSuites)
 	if !ok || s.id != esp.SuiteChaCha20Poly1305 {
 		t.Fatalf("clean ChaCha selection mapped to %v, ok=%v", s.id, ok)
 	}
 	// A selection of a suite that is not enabled must be rejected.
-	if _, ok := selectedESPSuite(clean, []espSuite{mustSuite(t, esp.SuiteAESCBC256SHA256)}); ok {
+	if _, ok := selectedSuite(clean, []espSuite{mustSuite(t, esp.SuiteAESCBC256SHA256)}); ok {
 		t.Fatal("a selection of a disabled suite was accepted")
 	}
 	// An AEAD selection with a single explicit AUTH_NONE INTEG is valid.
-	withNone := buildESPProposalForSuite(1, gcm, spi)
+	withNone := buildProposalForSuite(1, gcm, spi)
 	withNone.Transforms = append(withNone.Transforms, ikemsg.Transform{Type: ikemsg.TransformInteg, ID: ikemsg.AUTH_NONE})
-	if s, ok := selectedESPSuite(withNone, espSuites); !ok || s.id != esp.SuiteAESGCM256 {
+	if s, ok := selectedSuite(withNone, espSuites); !ok || s.id != esp.SuiteAESGCM256 {
 		t.Fatal("an AEAD selection with an explicit AUTH_NONE was rejected")
 	}
 }
@@ -438,19 +438,19 @@ func TestSelectESPProposalPreference(t *testing.T) {
 	cbc := mustSuite(t, esp.SuiteAESCBC256SHA256)
 	gcm := mustSuite(t, esp.SuiteAESGCM256)
 	offer := &ikemsg.SAPayload{Proposals: []ikemsg.Proposal{
-		buildESPProposalForSuite(1, cbc, []byte{1, 1, 1, 1}),
-		buildESPProposalForSuite(2, gcm, []byte{2, 2, 2, 2}),
+		buildProposalForSuite(1, cbc, []byte{1, 1, 1, 1}),
+		buildProposalForSuite(2, gcm, []byte{2, 2, 2, 2}),
 	}}
 
-	p, s, ok := selectESPProposal(offer, espSuites, 0)
+	p, s, ok := selectProposal(offer, espSuites, 0)
 	if !ok || s.id != esp.SuiteAESGCM256 || p.Number != 2 {
 		t.Fatalf("full table: picked %v #%d, want GCM #2", s.id, p.Number)
 	}
-	p, s, ok = selectESPProposal(offer, []espSuite{cbc}, 0)
+	p, s, ok = selectProposal(offer, []espSuite{cbc}, 0)
 	if !ok || s.id != esp.SuiteAESCBC256SHA256 || p.Number != 1 {
 		t.Fatalf("CBC-only: picked %v #%d, want CBC #1", s.id, p.Number)
 	}
-	if _, _, ok := selectESPProposal(offer, []espSuite{mustSuite(t, esp.SuiteChaCha20Poly1305)}, 0); ok {
+	if _, _, ok := selectProposal(offer, []espSuite{mustSuite(t, esp.SuiteChaCha20Poly1305)}, 0); ok {
 		t.Fatal("ChaCha-only matched an offer with no ChaCha proposal")
 	}
 }
@@ -461,15 +461,15 @@ func TestSelectESPProposalPreference(t *testing.T) {
 func TestSelectESPProposalRequireGroup(t *testing.T) {
 	gcm := mustSuite(t, esp.SuiteAESGCM256)
 	offer := &ikemsg.SAPayload{Proposals: []ikemsg.Proposal{
-		buildESPProposalForSuite(1, gcm, []byte{1, 1, 1, 1}), // no DH group
+		buildProposalForSuite(1, gcm, []byte{1, 1, 1, 1}), // no DH group
 		buildESPProposalCBC(2, []byte{2, 2, 2, 2}, ikemsg.DH_MODP2048),
 	}}
 
-	p, s, ok := selectESPProposal(offer, espSuites, ikemsg.DH_MODP2048)
+	p, s, ok := selectProposal(offer, espSuites, ikemsg.DH_MODP2048)
 	if !ok || s.id != esp.SuiteAESCBC256SHA256 || p.Number != 2 {
 		t.Fatalf("requireGroup: picked %v #%d, want CBC #2", s.id, p.Number)
 	}
-	if _, _, ok := selectESPProposal(offer, espSuites, ikemsg.DH_X25519); ok {
+	if _, _, ok := selectProposal(offer, espSuites, ikemsg.DH_X25519); ok {
 		t.Fatal("matched despite no proposal advertising the required group")
 	}
 }
@@ -484,7 +484,7 @@ func TestSuiteMatchToleratesAlternatives(t *testing.T) {
 	gcm := mustSuite(t, esp.SuiteAESGCM256)
 
 	multi := buildESPProposalMultiOption(1, []byte{1, 2, 3, 4})
-	if !suiteMatchesProposal(cbc, multi) {
+	if !suiteMatches(cbc, multi) {
 		t.Fatal("matcher rejected a valid multi-option offer (both-ESN regression)")
 	}
 
@@ -499,22 +499,22 @@ func TestSuiteMatchToleratesAlternatives(t *testing.T) {
 		},
 	}
 	for _, s := range espSuites {
-		if suiteMatchesProposal(s, gcm128) {
+		if suiteMatches(s, gcm128) {
 			t.Fatalf("%s matched an AES-GCM-128 proposal", s.name())
 		}
 	}
 
 	// [GCM-128, multi-CBC, GCM-256]: the full table picks GCM-256 (our top
 	// preference), a CBC-only config picks the multi-CBC offer.
-	gcm256 := buildESPProposalForSuite(3, gcm, []byte{5, 6, 7, 8})
+	gcm256 := buildProposalForSuite(3, gcm, []byte{5, 6, 7, 8})
 	saP := &ikemsg.SAPayload{Proposals: []ikemsg.Proposal{gcm128, multi, gcm256}}
-	p, s, ok := selectESPProposal(saP, espSuites, 0)
+	p, s, ok := selectProposal(saP, espSuites, 0)
 	if !ok || s.id != esp.SuiteAESGCM256 || !bytes.Equal(p.SPI, gcm256.SPI) {
-		t.Fatal("selectESPProposal did not pick the GCM-256 proposal")
+		t.Fatal("selectProposal did not pick the GCM-256 proposal")
 	}
-	p, s, ok = selectESPProposal(saP, []espSuite{cbc}, 0)
+	p, s, ok = selectProposal(saP, []espSuite{cbc}, 0)
 	if !ok || s.id != esp.SuiteAESCBC256SHA256 || !bytes.Equal(p.SPI, multi.SPI) {
-		t.Fatal("CBC-only selectESPProposal did not pick the multi-option CBC proposal")
+		t.Fatal("CBC-only selectProposal did not pick the multi-option CBC proposal")
 	}
 }
 

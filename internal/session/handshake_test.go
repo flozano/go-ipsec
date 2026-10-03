@@ -289,7 +289,7 @@ func runResponder(t *testing.T, conn transport.Conn, username, password string, 
 	respAuth := iauth.SharedSecretAuth(rs.ikeSA.PRF, msk, respSigned)
 	m10 := ikemsg.Payloads{
 		&ikemsg.AuthPayload{Method: iauth.MethodSharedKeyMIC, Data: respAuth},
-		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildESPProposalForSuite(1, suite, childSPIBuf[:])}},
+		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildProposalForSuite(1, suite, childSPIBuf[:])}},
 	}
 	appendTrafficSelectors(&m10, true)
 	ip := netip.MustParseAddr("10.10.0.42").As4()
@@ -461,7 +461,7 @@ func respondSAInit(ctx context.Context, conn transport.Conn, rs *Session, nr []b
 		Exchange:     ikemsg.ExchangeIKESAInit,
 		Flags:        ikemsg.FlagResponse,
 		Payloads: ikemsg.Payloads{
-			&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildIKEProposalForSuite(1, ike, nil, keiGroup)}},
+			&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildProposalForSuite(1, ike, nil, keiGroup)}},
 			&ikemsg.KEPayload{Group: keiGroup, Data: respDH.Public},
 			&ikemsg.NoncePayload{Data: nr},
 		},
@@ -479,14 +479,14 @@ func respondSAInit(ctx context.Context, conn transport.Conn, rs *Session, nr []b
 // cbcSuite returns the AES-CBC-256+HMAC ESP suite row for scripted responders
 // that run outside a *testing.T context (goroutines).
 func cbcSuite() espSuite {
-	s, _ := espSuiteByID(esp.SuiteAESCBC256SHA256)
+	s, _ := suiteByID(esp.SuiteAESCBC256SHA256, espSuites)
 	return s
 }
 
 // gcmIKESuite returns the AES-GCM-256 IKE suite row (the default preference)
 // for scripted responders that run outside a *testing.T context (goroutines).
 func gcmIKESuite() ikeSuite {
-	s, _ := ikeSuiteByID(ikesa.SuiteAESGCM256)
+	s, _ := suiteByID(ikesa.SuiteAESGCM256, ikeSuites)
 	return s
 }
 
@@ -552,7 +552,7 @@ func runResponderPSK(conn transport.Conn, psk []byte, suite espSuite, mangle fun
 	res.childResponderSPI = binary.BigEndian.Uint32(childSPIBuf[:])
 	res.childKeys = rs.ikeSA.DeriveChildKeys(ni, nr, suite.encrKeyLen, suite.integKeyLen)
 
-	prop := buildESPProposalForSuite(1, suite, childSPIBuf[:])
+	prop := buildProposalForSuite(1, suite, childSPIBuf[:])
 	if mangle != nil {
 		mangle(&prop)
 	}
@@ -904,7 +904,7 @@ func cookieResponder(conn transport.Conn, cookie []byte) error {
 		Exchange:     ikemsg.ExchangeIKESAInit,
 		Flags:        ikemsg.FlagResponse,
 		Payloads: ikemsg.Payloads{
-			&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildIKEProposalForSuite(1, gcmIKESuite(), nil, keiGroup)}},
+			&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildProposalForSuite(1, gcmIKESuite(), nil, keiGroup)}},
 			&ikemsg.KEPayload{Group: keiGroup, Data: respDH.Public},
 			&ikemsg.NoncePayload{Data: bytes.Repeat([]byte{0x42}, 32)},
 		},
@@ -990,7 +990,7 @@ func dropFirstSAInitResponder(conn transport.Conn) error {
 		Exchange:     ikemsg.ExchangeIKESAInit,
 		Flags:        ikemsg.FlagResponse,
 		Payloads: ikemsg.Payloads{
-			&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildIKEProposalForSuite(1, gcmIKESuite(), nil, keiGroup)}},
+			&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildProposalForSuite(1, gcmIKESuite(), nil, keiGroup)}},
 			&ikemsg.KEPayload{Group: keiGroup, Data: respDH.Public},
 			&ikemsg.NoncePayload{Data: bytes.Repeat([]byte{0x42}, 32)},
 		},
@@ -1109,7 +1109,7 @@ func invalidKEResponder(conn transport.Conn) error {
 		Exchange:     ikemsg.ExchangeIKESAInit,
 		Flags:        ikemsg.FlagResponse,
 		Payloads: ikemsg.Payloads{
-			&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildIKEProposalForSuite(1, gcmIKESuite(), nil, keiGroup)}},
+			&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildProposalForSuite(1, gcmIKESuite(), nil, keiGroup)}},
 			&ikemsg.KEPayload{Group: keiGroup, Data: respDH.Public},
 			&ikemsg.NoncePayload{Data: bytes.Repeat([]byte{0x42}, 32)},
 		},
@@ -1360,7 +1360,7 @@ func invalidKEThenCookieResponder(conn transport.Conn) error {
 		Exchange:     ikemsg.ExchangeIKESAInit,
 		Flags:        ikemsg.FlagResponse,
 		Payloads: ikemsg.Payloads{
-			&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildIKEProposalForSuite(1, gcmIKESuite(), nil, keiGroup)}},
+			&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildProposalForSuite(1, gcmIKESuite(), nil, keiGroup)}},
 			&ikemsg.KEPayload{Group: keiGroup, Data: respDH.Public},
 			&ikemsg.NoncePayload{Data: bytes.Repeat([]byte{0x42}, 32)},
 		},
@@ -1475,7 +1475,7 @@ func saInitOnlyResponder(conn transport.Conn, mangle func(*ikemsg.Proposal)) err
 	if _, err := respDH.Shared(keiData); err != nil {
 		return err
 	}
-	prop := buildIKEProposalForSuite(1, gcmIKESuite(), nil, keiGroup)
+	prop := buildProposalForSuite(1, gcmIKESuite(), nil, keiGroup)
 	if mangle != nil {
 		mangle(&prop)
 	}

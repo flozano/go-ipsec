@@ -85,7 +85,7 @@ func (s *Session) ikeAuthPSK(ctx context.Context) error {
 	first := ikemsg.Payloads{
 		&ikemsg.IDiPayload{IDType: ikemsg.IDType(s.cfg.LocalID.Type), Data: s.cfg.LocalID.Data},
 		&ikemsg.AuthPayload{Method: auth.MethodSharedKeyMIC, Data: s.computeInitiatorAuth(s.cfg.PSK)},
-		&ikemsg.SAPayload{Proposals: buildESPProposals(spi, s.enabledESPSuites(), preferredDHGroups...)},
+		&ikemsg.SAPayload{Proposals: buildProposals(spi, s.enabledESPSuites(), preferredDHGroups...)},
 	}
 	appendTrafficSelectors(&first, s.cfg.RequestIPv6)
 	buildCPRequest(&first, s.cfg.RequestIPv6)
@@ -121,7 +121,7 @@ func (s *Session) ikeAuthEAP(ctx context.Context) error {
 	// preference order.
 	first := ikemsg.Payloads{
 		&ikemsg.IDiPayload{IDType: ikemsg.IDType(s.cfg.LocalID.Type), Data: s.cfg.LocalID.Data},
-		&ikemsg.SAPayload{Proposals: buildESPProposals(spi, s.enabledESPSuites(), preferredDHGroups...)},
+		&ikemsg.SAPayload{Proposals: buildProposals(spi, s.enabledESPSuites(), preferredDHGroups...)},
 	}
 	appendTrafficSelectors(&first, s.cfg.RequestIPv6)
 	buildCPRequest(&first, s.cfg.RequestIPv6)
@@ -314,7 +314,7 @@ func (s *Session) handleFinalAuthResponse(payloads ikemsg.Payloads, secret []byt
 		return errors.New("session: final IKE_AUTH missing the responder's ESP proposal")
 	}
 	prop := saP.Proposals[0]
-	suite, ok := selectedESPSuite(prop, s.enabledESPSuites())
+	suite, ok := selectedSuite(prop, s.enabledESPSuites())
 	if !ok {
 		return fmt.Errorf("session: responder selected an unsupported or ambiguous ESP proposal (%s)", describeProposals(saP))
 	}

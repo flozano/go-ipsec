@@ -87,7 +87,11 @@ func marshalProposal(p *Proposal, more bool) ([]byte, error) {
 	out = append(out, p.SPI...)
 
 	for i := range p.Transforms {
-		out = append(out, marshalTransform(p.Transforms[i], i+1 < len(p.Transforms))...)
+		td, err := marshalTransform(p.Transforms[i], i+1 < len(p.Transforms))
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, td...)
 	}
 	binary.BigEndian.PutUint16(out[2:4], uint16(len(out)))
 	return out, nil
@@ -96,8 +100,13 @@ func marshalProposal(p *Proposal, more bool) ([]byte, error) {
 // marshalTransform encodes one transform substructure (RFC 7296 §3.3.2). more is
 // the first octet: 3 ("more transforms follow") for any but the last, 0 for the
 // last. A present KeyLength attribute is appended as a 4-byte TV attribute
-// (RFC 7296 §3.3.5).
-func marshalTransform(t Transform, more bool) []byte {
+// (RFC 7296 §3.3.5). A non-zero KeyLength without HasKeyLength is rejected: it
+// is an inconsistent struct (most likely a literal that forgot HasKeyLength) and
+// emitting it would silently drop the key length from the wire.
+func marshalTransform(t Transform, more bool) ([]byte, error) {
+	if t.KeyLength != 0 && !t.HasKeyLength {
+		return nil, fmt.Errorf("transform type %d id %d: KeyLength %d set without HasKeyLength", t.Type, t.ID, t.KeyLength)
+	}
 	// Header: more(1) | RESERVED(1) | Length(2) | Type(1) | RESERVED(1) | ID(2)
 	out := make([]byte, 8)
 	if more {
@@ -109,16 +118,16 @@ func marshalTransform(t Transform, more bool) []byte {
 	if t.HasKeyLength {
 		// TV attribute: the high bit (0x8000) flags the TV format, OR'd with the
 		// attribute type; the value is the 2-byte key length in bits. HasKeyLength
-		// is the single source of truth: a transform that must NOT carry the
-		// attribute (ChaCha20-Poly1305, RFC 7634) sets it false even if KeyLength
-		// happens to be zero, and an explicit KEY_LENGTH=0 would still be emitted.
+		// decides presence: a transform that must NOT carry the attribute
+		// (ChaCha20-Poly1305, RFC 7634) leaves it false (and KeyLength zero), and
+		// an explicit KEY_LENGTH=0 is still emitted when it is true.
 		var attr [4]byte
 		binary.BigEndian.PutUint16(attr[0:2], 0x8000|AttrKeyLength)
 		binary.BigEndian.PutUint16(attr[2:4], t.KeyLength)
 		out = append(out, attr[:]...)
 	}
 	binary.BigEndian.PutUint16(out[2:4], uint16(len(out)))
-	return out
+	return out, nil
 }
 
 func (sa *SAPayload) unmarshalBody(body []byte) error {

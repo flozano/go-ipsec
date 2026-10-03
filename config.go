@@ -206,9 +206,19 @@ func (cs CipherSuite) ikeSuite() (ikesa.Suite, bool) {
 	}
 }
 
+// defined reports whether cs is a suite of either layer.
+func (cs CipherSuite) defined() bool {
+	_, esp := cs.espSuite()
+	_, ike := cs.ikeSuite()
+	return esp || ike
+}
+
 // String implements fmt.Stringer with the conventional transform names.
 func (cs CipherSuite) String() string {
 	if id, ok := cs.espSuite(); ok {
+		return id.String()
+	}
+	if id, ok := cs.ikeSuite(); ok {
 		return id.String()
 	}
 	return fmt.Sprintf("ipsec-cipher-suite-%d", uint8(cs))
@@ -275,13 +285,13 @@ func (c *Config) validate() error {
 	// than at the handshake. Each list is validated against its own layer's
 	// suite mapper so an ESP-only (or IKE-only) suite added later cannot slip
 	// through the wrong list and then be silently dropped at offer time.
-	if err := validateCipherSuites("ESPCipherSuites", c.ESPCipherSuites, func(cs CipherSuite) bool {
+	if err := validateCipherSuites("ESPCipherSuites", "ESP", c.ESPCipherSuites, func(cs CipherSuite) bool {
 		_, ok := cs.espSuite()
 		return ok
 	}); err != nil {
 		return err
 	}
-	if err := validateCipherSuites("IKECipherSuites", c.IKECipherSuites, func(cs CipherSuite) bool {
+	if err := validateCipherSuites("IKECipherSuites", "IKE", c.IKECipherSuites, func(cs CipherSuite) bool {
 		_, ok := cs.ikeSuite()
 		return ok
 	}); err != nil {
@@ -348,11 +358,15 @@ func (c *Config) validate() error {
 // cipher-suite list; field names the offending Config field in the error and
 // known reports whether a value maps to a suite implemented by that layer (the
 // ESP and IKE layers happen to share a domain today, but validating each
-// against its own mapper keeps them decoupled).
-func validateCipherSuites(field string, suites []CipherSuite, known func(CipherSuite) bool) error {
+// against its own mapper keeps them decoupled). A value valid only in the other
+// layer is reported as unsupported for this layer rather than as unknown.
+func validateCipherSuites(field, layer string, suites []CipherSuite, known func(CipherSuite) bool) error {
 	seen := make(map[CipherSuite]bool, len(suites))
 	for _, cs := range suites {
 		if !known(cs) {
+			if cs.defined() {
+				return fmt.Errorf("ipsec: Config.%s: cipher suite %v is not supported for %s", field, cs, layer)
+			}
 			return fmt.Errorf("ipsec: Config.%s: unknown cipher suite %d", field, uint8(cs))
 		}
 		if seen[cs] {

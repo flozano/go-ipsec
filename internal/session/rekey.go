@@ -141,9 +141,9 @@ func (s *Session) initiateChildRekey(ctx context.Context, reestablish bool) erro
 	// Offer the full enabled suite table again (a rekey may migrate the Child SA
 	// to a more preferred suite the server has since enabled).
 	if dh != nil {
-		inner = append(inner, &ikemsg.SAPayload{Proposals: buildESPProposals(newSPI, s.enabledESPSuites(), dh.Group)})
+		inner = append(inner, &ikemsg.SAPayload{Proposals: buildProposals(newSPI, s.enabledESPSuites(), dh.Group)})
 	} else {
-		inner = append(inner, &ikemsg.SAPayload{Proposals: buildESPProposals(newSPI, s.enabledESPSuites())})
+		inner = append(inner, &ikemsg.SAPayload{Proposals: buildProposals(newSPI, s.enabledESPSuites())})
 	}
 	inner = append(inner, &ikemsg.NoncePayload{Data: ni})
 	if dh != nil {
@@ -293,10 +293,10 @@ func (s *Session) handleChildRekeyRequest(ctx context.Context, hdr *ikemsg.Messa
 	// KE present the matched proposal must also advertise the KE group: the DH
 	// exchange may only run against a proposal that offered it, and the group may
 	// be spread across only some of the peer's proposals.
-	prop, suite, ok := selectESPProposal(saP, s.enabledESPSuites(), requireGroup)
+	prop, suite, ok := selectProposal(saP, s.enabledESPSuites(), requireGroup)
 	if !ok {
 		if requireGroup != 0 {
-			if _, _, okSansGroup := selectESPProposal(saP, s.enabledESPSuites(), 0); okSansGroup {
+			if _, _, okSansGroup := selectProposal(saP, s.enabledESPSuites(), 0); okSansGroup {
 				// A suite matches, but no matching proposal advertises the KE group —
 				// answer with the group we accept so the peer can retry.
 				s.sendInvalidKEPayload(ctx, dec, hdr.MessageID, viaOld)
@@ -313,19 +313,25 @@ func (s *Session) handleChildRekeyRequest(ctx context.Context, hdr *ikemsg.Messa
 	var pfsShared []byte
 	if ke != nil {
 		if dh, err = ikesa.NewDH(ke.Group); err != nil {
+			s.sendTemporaryFailure(ctx, dec, hdr.MessageID, viaOld)
 			return err
 		}
 		if pfsShared, err = dh.Shared(ke.Data); err != nil {
+			// Answer (and cache) a malformed KE value rather than leaving the peer
+			// retransmitting into silence (mirrors handleIKERekeyRequest).
+			s.sendNotifyResponse(ctx, dec, hdr.MessageID, viaOld, ikemsg.ProtocolNone, ikemsg.NotifyInvalidSyntax, nil, "child rekey: invalid KE")
 			return fmt.Errorf("session: Child SA rekey DH: %w", err)
 		}
 	}
 
 	newSPI, err := randBytes(4)
 	if err != nil {
+		s.sendTemporaryFailure(ctx, dec, hdr.MessageID, viaOld)
 		return err
 	}
 	nr, err := randBytes(nonceLen)
 	if err != nil {
+		s.sendTemporaryFailure(ctx, dec, hdr.MessageID, viaOld)
 		return err
 	}
 
@@ -336,9 +342,9 @@ func (s *Session) handleChildRekeyRequest(ctx context.Context, hdr *ikemsg.Messa
 	// peer's preferred offer differs. A PFS rekey keeps the DH-group transform
 	// and answers with our own KE payload.
 	if dh != nil {
-		resp = append(resp, &ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildESPProposalForSuite(prop.Number, suite, newSPI, dh.Group)}})
+		resp = append(resp, &ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildProposalForSuite(prop.Number, suite, newSPI, dh.Group)}})
 	} else {
-		resp = append(resp, &ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildESPProposalForSuite(prop.Number, suite, newSPI)}})
+		resp = append(resp, &ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildProposalForSuite(prop.Number, suite, newSPI)}})
 	}
 	resp = append(resp, &ikemsg.NoncePayload{Data: nr})
 	if dh != nil {
@@ -463,7 +469,7 @@ func (s *Session) childRekeyResponse(inner ikemsg.Payloads) (prop ikemsg.Proposa
 		return ikemsg.Proposal{}, espSuite{}, nil, nil, errors.New("session: Child SA rekey response carries no proposal")
 	}
 	prop = saP.Proposals[0]
-	suite, ok := selectedESPSuite(prop, s.enabledESPSuites())
+	suite, ok := selectedSuite(prop, s.enabledESPSuites())
 	if !ok || len(prop.SPI) != 4 {
 		return ikemsg.Proposal{}, espSuite{}, nil, nil, fmt.Errorf("session: Child SA rekey response selected an unsupported or ambiguous proposal (%s)", describeProposals(saP))
 	}
@@ -531,7 +537,7 @@ func (s *Session) initiateIKERekey(ctx context.Context) error {
 	// Offer the full enabled IKE suite table again (a rekey may migrate the
 	// envelope to a more preferred suite the server has since enabled).
 	inner := ikemsg.Payloads{
-		&ikemsg.SAPayload{Proposals: buildIKEProposalsSPI(spi[:], s.enabledIKESuites(), dh.Group)},
+		&ikemsg.SAPayload{Proposals: buildProposals(spi[:], s.enabledIKESuites(), dh.Group)},
 		&ikemsg.NoncePayload{Data: ni},
 		&ikemsg.KEPayload{Group: dh.Group, Data: dh.Public},
 	}
@@ -565,7 +571,7 @@ func (s *Session) completeIKERekey(ctx context.Context, inner ikemsg.Payloads, p
 	// the suite determines the SKEYSEED split for the new SA, so an ambiguous
 	// echo would leave the key lengths undefined (mirrors childRekeyResponse).
 	prop := saP.Proposals[0]
-	suite, ok := selectedIKESuite(prop, s.enabledIKESuites())
+	suite, ok := selectedSuite(prop, s.enabledIKESuites())
 	if !ok || len(prop.SPI) != 8 {
 		return fmt.Errorf("session: IKE rekey response selected an unsupported or ambiguous proposal (%s)", describeProposals(saP))
 	}
@@ -591,23 +597,13 @@ func (s *Session) completeIKERekey(ctx context.Context, inner ikemsg.Payloads, p
 	return nil
 }
 
-// handleIKERekeyRequest answers a server-initiated IKE SA rekey. viaOld reports
-// whether the request arrived under the superseded IKE SA (rekey grace window),
-// selecting the matching responder-dedup slot.
-func (s *Session) handleIKERekeyRequest(ctx context.Context, hdr *ikemsg.Message, inner ikemsg.Payloads, dec *ikeCtx, viaOld bool) error {
-	// A server IKE rekey arriving under the superseded SA during the grace window
-	// would force a SECOND cutover keyed from a dying SA, and the subsequent
-	// swapIKE (s.oldPeer = s.peer) would clobber the response we cache below —
-	// leaving a retransmit unanswerable and the request-carrying SA dropped.
-	// Decline with TEMPORARY_FAILURE; the peer retries (RFC 7296 §2.25) once the
-	// grace window has expired and the request arrives under the current SA. The
-	// notify is cached in the oldPeer dedup slot (no swap follows) so a retransmit
-	// of this request is answered from cache rather than reprocessed.
-	if viaOld {
-		s.sendTemporaryFailure(ctx, dec, hdr.MessageID, viaOld)
-		s.log.Debug("declined server IKE rekey arriving under the superseded SA during grace")
-		return nil
-	}
+// handleIKERekeyRequest answers a server-initiated IKE SA rekey arriving under
+// the CURRENT IKE SA (handleInbound declines one arriving under the superseded
+// SA before dispatching here), so dec.sa is s.ikeSA and the response is cached
+// in the current-SA dedup slot. Every path that answers the request caches its
+// response, so a retransmit is replayed from cache rather than reprocessed.
+func (s *Session) handleIKERekeyRequest(ctx context.Context, hdr *ikemsg.Message, inner ikemsg.Payloads, dec *ikeCtx) error {
+	const viaOld = false
 	saP, ni, kei, err := ikeRekeyPayloads(inner)
 	if err != nil {
 		// Cache an error response so retransmits are answered, not reprocessed.
@@ -627,9 +623,9 @@ func (s *Session) handleIKERekeyRequest(ctx context.Context, hdr *ikemsg.Message
 	// only run against a proposal that offered it). A suite matching only
 	// outside the group constraint draws INVALID_KE_PAYLOAD so the peer can
 	// retry; no suite at all draws NO_PROPOSAL_CHOSEN (mirrors the Child path).
-	prop, suite, ok := selectIKEProposal(saP, s.enabledIKESuites(), group)
+	prop, suite, ok := selectProposal(saP, s.enabledIKESuites(), group)
 	if !ok {
-		if _, _, okSansGroup := selectIKEProposal(saP, s.enabledIKESuites(), 0); okSansGroup {
+		if _, _, okSansGroup := selectProposal(saP, s.enabledIKESuites(), 0); okSansGroup {
 			s.sendInvalidKEPayload(ctx, dec, hdr.MessageID, viaOld)
 			s.log.Debug("declined server IKE rekey: KE group not offered by a matching proposal", "group", group)
 			return nil
@@ -638,30 +634,34 @@ func (s *Session) handleIKERekeyRequest(ctx context.Context, hdr *ikemsg.Message
 		return fmt.Errorf("session: no offered IKE proposal matches our suites (%s)", describeProposals(saP))
 	}
 	serverNewSPIi := binary.BigEndian.Uint64(prop.SPI)
-	newSPIr, err := randUint64()
-	if err != nil {
-		return err
-	}
 	dh, err := ikesa.NewDH(group)
 	if err != nil {
-		return err
-	}
-	nr, err := randBytes(nonceLen)
-	if err != nil {
+		s.sendTemporaryFailure(ctx, dec, hdr.MessageID, viaOld)
 		return err
 	}
 	shared, err := dh.Shared(kei.Data)
 	if err != nil {
+		// A malformed KE value (e.g. the wrong length for its group) is the
+		// peer's syntax error: answer it rather than letting the peer retransmit
+		// into silence until it declares the IKE SA dead.
+		s.sendNotifyResponse(ctx, dec, hdr.MessageID, viaOld, ikemsg.ProtocolNone, ikemsg.NotifyInvalidSyntax, nil, "IKE rekey: invalid KE")
 		return fmt.Errorf("session: IKE rekey DH: %w", err)
 	}
-	// Key the new IKE SA from the SK_d of the SA that carried this request (dec.sa,
-	// which may be the superseded SA during the rekey grace window) per RFC 7296
-	// §2.18 — not s.ikeSA.SKd, which after a just-completed cutover is a different
-	// SA's SK_d and would diverge from the peer when the request arrives viaOld.
-	// Mirrors the Child-rekey path (which derives from dec.sa) and the response
-	// framing below, which already encodes under dec.sa.
+	newSPIr, err := randUint64()
+	if err != nil {
+		s.sendTemporaryFailure(ctx, dec, hdr.MessageID, viaOld)
+		return err
+	}
+	nr, err := randBytes(nonceLen)
+	if err != nil {
+		s.sendTemporaryFailure(ctx, dec, hdr.MessageID, viaOld)
+		return err
+	}
+	// Key the new IKE SA from the SK_d of the SA that carried this request (RFC
+	// 7296 §2.18) — the current SA, see the function comment.
 	newIKE, err := ikesa.DeriveRekeyIKE(suite.id, dec.sa.SKd, ikesa.Responder, serverNewSPIi, newSPIr, ni, nr, shared)
 	if err != nil {
+		s.sendTemporaryFailure(ctx, dec, hdr.MessageID, viaOld)
 		return err
 	}
 
@@ -671,27 +671,34 @@ func (s *Session) handleIKERekeyRequest(ctx context.Context, hdr *ikemsg.Message
 	// 7296 §2.7) — not a rebuild of some fixed suite, which would desync the
 	// key schedule whenever the peer's preferred offer differs from ours.
 	resp := ikemsg.Payloads{
-		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildIKEProposalForSuite(prop.Number, suite, spi[:], dh.Group)}},
+		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildProposalForSuite(prop.Number, suite, spi[:], dh.Group)}},
 		&ikemsg.NoncePayload{Data: nr},
 		&ikemsg.KEPayload{Group: dh.Group, Data: dh.Public},
 	}
 	raw, err := encodeSKWith(dec.sa, dec.spii, dec.spir,
 		ikemsg.ExchangeCreateChildSA, ikeRoleBit(dec.sa.Role)|ikemsg.FlagResponse, hdr.MessageID, resp)
 	if err != nil {
+		s.sendTemporaryFailure(ctx, dec, hdr.MessageID, viaOld)
 		return err
 	}
-	// Cache before swapIKE (which migrates s.peer → s.oldPeer) so a retransmit
-	// of this request, arriving under the old SA during grace, resends this
-	// response instead of deriving a third IKE SA and corrupting the cutover.
+	// Cache, then cut over, then send. Caching before swapIKE (which migrates
+	// s.peer → s.oldPeer) lets a retransmit of this request, arriving under the
+	// old SA during grace, resend this response instead of deriving a third IKE
+	// SA. Swapping BEFORE the send mirrors the Child path's install-before-send:
+	// once the response is cached the peer can complete the rekey from a
+	// retransmit, so a failed send must not leave us without the new SA's keys
+	// (the peer would cut over to newSPIr and then DELETE the old SA, which we
+	// would take as a teardown of the tunnel).
 	s.recordPeerResponse(viaOld, hdr.MessageID, raw)
-	if err := s.sendDatagram(ctx, raw); err != nil {
-		return err
-	}
-	// Cut over to the new SA; the server will DELETE the old SA under the old
-	// SA, which we ack via the grace-decode path.
 	s.swapIKE(newIKE, serverNewSPIi, newSPIr)
-	s.log.Info("IKE SA rekeyed (responder)", "suite", suite.name())
-	return nil
+	// The server may rekey in a different (supported) group than IKE_SA_INIT
+	// negotiated; adopt it so our own later IKE rekeys — which offer only
+	// ikeDHGroup — and the Child PFS fallback use the group the server runs now.
+	s.ikeDHGroup = dh.Group
+	s.log.Info("IKE SA rekeyed (responder)", "suite", suite.name(), "group", dh.Group)
+	// The server will DELETE the old SA under the old SA, which we ack via the
+	// grace-decode path.
+	return s.sendDatagram(ctx, raw)
 }
 
 // sendIKEDeleteUnderCurrent sends INFORMATIONAL{ Delete(IKE, SPISize=0) } under
@@ -740,8 +747,8 @@ func (s *Session) swapIKE(newIKE *ikesa.IKESA, spii, spir uint64) {
 // (returned whole so callers can read its DH group) from a CREATE_CHILD_SA
 // IKE-rekey request or response. Proposal/suite selection is left to the
 // caller: a response we receive demands a strict narrowed selection
-// (selectedIKESuite), a peer request a preference-ordered pick constrained by
-// the KE group (selectIKEProposal) — mirrors childRekeyRequestPayloads.
+// (selectedSuite), a peer request a preference-ordered pick constrained by
+// the KE group (selectProposal) — mirrors childRekeyRequestPayloads.
 func ikeRekeyPayloads(inner ikemsg.Payloads) (saP *ikemsg.SAPayload, nonce []byte, ke *ikemsg.KEPayload, err error) {
 	for _, p := range inner {
 		switch v := p.(type) {

@@ -160,7 +160,6 @@ func run(opts *cliOpts, logger *slog.Logger) error {
 		case <-sigCh:
 		case <-grace.C:
 		}
-		grace.Stop() // os.Exit skips defers, so stop the timer inline
 		os.Exit(130)
 	}()
 

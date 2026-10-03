@@ -729,3 +729,20 @@ func TestMarshalRejectsOversizedPayloadBody(t *testing.T) {
 		t.Fatalf("boundary-size payload rejected: %v", err)
 	}
 }
+
+// TestMarshalRejectsKeyLengthWithoutFlag: a transform carrying a KeyLength but
+// not HasKeyLength is an inconsistent struct; marshalling it must fail rather
+// than silently drop the Key Length attribute from the wire.
+func TestMarshalRejectsKeyLengthWithoutFlag(t *testing.T) {
+	sa := &SAPayload{Proposals: []Proposal{{
+		Number: 1, Protocol: ProtocolESP, SPI: []byte{1, 2, 3, 4},
+		Transforms: []Transform{{Type: TransformEncr, ID: ENCR_AES_GCM_16, KeyLength: 256}},
+	}}}
+	if _, err := sa.marshalBody(); err == nil {
+		t.Fatal("KeyLength without HasKeyLength was marshalled")
+	}
+	sa.Proposals[0].Transforms[0].HasKeyLength = true
+	if _, err := sa.marshalBody(); err != nil {
+		t.Fatal(err)
+	}
+}

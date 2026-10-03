@@ -150,9 +150,21 @@ func (s *Session) handleInbound(ctx context.Context, raw []byte, onDead func()) 
 			s.sendTemporaryFailure(ctx, dec, hdr.MessageID, viaOld)
 			return false
 		}
+		ikeRekey := isIKERekey(inner)
+		// A server IKE rekey arriving under the superseded SA during the grace
+		// window would force a SECOND cutover keyed from a dying SA, and its
+		// swapIKE (s.oldPeer = s.peer) would clobber the response cached for it —
+		// leaving a retransmit unanswerable. Decline with TEMPORARY_FAILURE
+		// (cached in the oldPeer slot; no swap follows); the peer retries (RFC
+		// 7296 §2.25) once the request arrives under the current SA.
+		if ikeRekey && viaOld {
+			s.sendTemporaryFailure(ctx, dec, hdr.MessageID, viaOld)
+			s.log.Debug("declined server IKE rekey arriving under the superseded SA during grace")
+			return false
+		}
 		var rerr error
-		if isIKERekey(inner) {
-			rerr = s.handleIKERekeyRequest(ctx, hdr, inner, dec, viaOld)
+		if ikeRekey {
+			rerr = s.handleIKERekeyRequest(ctx, hdr, inner, dec)
 		} else {
 			rerr = s.handleChildRekeyRequest(ctx, hdr, inner, dec, viaOld)
 		}
@@ -224,7 +236,7 @@ func (s *Session) sendNotifyResponse(ctx context.Context, dec *ikeCtx, msgID uin
 // sendTemporaryFailure answers a server CREATE_CHILD_SA request with a
 // TEMPORARY_FAILURE notify (used to decline a colliding simultaneous rekey).
 func (s *Session) sendTemporaryFailure(ctx context.Context, dec *ikeCtx, msgID uint32, viaOld bool) {
-	s.sendNotifyResponse(ctx, dec, msgID, viaOld, ikemsg.ProtocolNone, ikemsg.NotifyTemporaryFailure, nil, "rekey collision TEMPORARY_FAILURE")
+	s.sendNotifyResponse(ctx, dec, msgID, viaOld, ikemsg.ProtocolNone, ikemsg.NotifyTemporaryFailure, nil, "TEMPORARY_FAILURE")
 }
 
 // completeMatchingRekey finishes a rekey we initiated when its response arrives.

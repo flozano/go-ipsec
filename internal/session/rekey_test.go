@@ -52,7 +52,7 @@ func serverIKERekey(t *testing.T, respS *Session, msgID uint32, spi uint64, grou
 	var spiBuf [8]byte
 	binary.BigEndian.PutUint64(spiBuf[:], spi)
 	inner := ikemsg.Payloads{
-		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildIKEProposalForSuite(1, gcmIKESuite(), spiBuf[:], group)}},
+		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildProposalForSuite(1, gcmIKESuite(), spiBuf[:], group)}},
 		&ikemsg.NoncePayload{Data: ni},
 		&ikemsg.KEPayload{Group: group, Data: dhPub},
 	}
@@ -292,7 +292,7 @@ func TestIKERekeyInitiatorRoundTrip(t *testing.T) {
 	if !isIKERekey(inner) {
 		t.Fatal("expected an IKE rekey request")
 	}
-	if err := respS.handleIKERekeyRequest(ctx, hdr, inner, dec, false); err != nil {
+	if err := respS.handleIKERekeyRequest(ctx, hdr, inner, dec); err != nil {
 		t.Fatal(err)
 	}
 	// Responder cut over.
@@ -1557,7 +1557,7 @@ func TestIKERekeyX25519RoundTrip(t *testing.T) {
 	if keGroup != ikemsg.DH_X25519 {
 		t.Fatalf("IKE rekey KE group = %d, want 31", keGroup)
 	}
-	if err := respS.handleIKERekeyRequest(ctx, hdr, inner, dec, false); err != nil {
+	if err := respS.handleIKERekeyRequest(ctx, hdr, inner, dec); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1671,7 +1671,7 @@ func TestChildRekeyOffersFullSuiteTable(t *testing.T) {
 		if prop.Number != uint8(i+1) {
 			t.Fatalf("proposal %d numbered %d, want %d", i, prop.Number, i+1)
 		}
-		if !suiteMatchesProposal(suite, prop) {
+		if !suiteMatches(suite, prop) {
 			t.Fatalf("proposal %d does not carry suite %s", i, suite.name())
 		}
 		if suite.aead() && len(prop.ByType(ikemsg.TransformInteg)) != 0 {
@@ -1705,7 +1705,7 @@ func TestChildRekeySuiteSwitch(t *testing.T) {
 	// Responder selects ChaCha (proposal number 2 in our offer).
 	respNr := bytes.Repeat([]byte{0xEA}, nonceLen)
 	resp := ikemsg.Payloads{
-		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildESPProposalForSuite(2, chacha, []byte{0xAB, 0xCD, 0xEF, 0x70})}},
+		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{buildProposalForSuite(2, chacha, []byte{0xAB, 0xCD, 0xEF, 0x70})}},
 		&ikemsg.NoncePayload{Data: respNr},
 	}
 	appendTrafficSelectors(&resp, false)
@@ -1759,7 +1759,7 @@ func TestChildRekeyResponseAmbiguousRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ambiguous := buildESPProposalForSuite(1, gcm, []byte{0xAB, 0xCD, 0xEF, 0x71})
+	ambiguous := buildProposalForSuite(1, gcm, []byte{0xAB, 0xCD, 0xEF, 0x71})
 	ambiguous.Transforms = append(ambiguous.Transforms,
 		ikemsg.Transform{Type: ikemsg.TransformEncr, ID: ikemsg.ENCR_CHACHA20_POLY1305})
 	resp := ikemsg.Payloads{
@@ -1888,7 +1888,7 @@ func TestServerChildRekeyRequireGroupFallsBack(t *testing.T) {
 	inner := ikemsg.Payloads{
 		&ikemsg.NotifyPayload{Protocol: ikemsg.ProtocolESP, Type: ikemsg.NotifyRekeySA, SPI: []byte{0, 0, 0x22, 0x22}},
 		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{
-			buildESPProposalForSuite(1, gcm, []byte{0xAB, 0xCD, 0xEF, 0x82}), // no DH group
+			buildProposalForSuite(1, gcm, []byte{0xAB, 0xCD, 0xEF, 0x82}), // no DH group
 			buildESPProposalCBC(2, []byte{0xAB, 0xCD, 0xEF, 0x82}, ikemsg.DH_MODP2048),
 		}},
 		&ikemsg.NoncePayload{Data: bytes.Repeat([]byte{0xDE}, nonceLen)},
@@ -2037,7 +2037,7 @@ func TestIKERekeySuiteSwitch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := respS.handleIKERekeyRequest(ctx, hdr, inner, dec, false); err != nil {
+	if err := respS.handleIKERekeyRequest(ctx, hdr, inner, dec); err != nil {
 		t.Fatal(err)
 	}
 	if respS.ikeSA.Suite != ikesa.SuiteChaCha20Poly1305 {
@@ -2172,7 +2172,7 @@ func TestIKERekeyResponseAmbiguousRejected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ambiguous := buildIKEProposalForSuite(1, gcmIKESuite(), bytes.Repeat([]byte{0x5D}, 8), offeredGroup)
+	ambiguous := buildProposalForSuite(1, gcmIKESuite(), bytes.Repeat([]byte{0x5D}, 8), offeredGroup)
 	ambiguous.Transforms = append(ambiguous.Transforms,
 		ikemsg.Transform{Type: ikemsg.TransformEncr, ID: ikemsg.ENCR_CHACHA20_POLY1305})
 	resp := ikemsg.Payloads{
@@ -2205,7 +2205,7 @@ func TestServerIKERekeyGroupNotOffered(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Proposal advertises ONLY group 19 (ECP-256); the KE claims group 14.
-	prop := buildIKEProposalForSuite(1, gcmIKESuite(), bytes.Repeat([]byte{0x5E}, 8), 19)
+	prop := buildProposalForSuite(1, gcmIKESuite(), bytes.Repeat([]byte{0x5E}, 8), 19)
 	inner := ikemsg.Payloads{
 		&ikemsg.SAPayload{Proposals: []ikemsg.Proposal{prop}},
 		&ikemsg.NoncePayload{Data: bytes.Repeat([]byte{0xDF}, nonceLen)},
