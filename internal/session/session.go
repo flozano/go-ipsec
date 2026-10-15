@@ -18,6 +18,7 @@ import (
 	"github.com/n0madic/go-ipsec/internal/esp"
 	"github.com/n0madic/go-ipsec/internal/ikemsg"
 	"github.com/n0madic/go-ipsec/internal/ikesa"
+	"github.com/n0madic/go-ipsec/internal/natt"
 	"github.com/n0madic/go-ipsec/internal/secretmem"
 	"github.com/n0madic/go-ipsec/internal/transport"
 )
@@ -203,6 +204,12 @@ func (s *Session) IKESAInit(ctx context.Context) error {
 			return err
 		}
 		s.conn = conn
+		// Starting on the NAT-T port (RFC 7296 §2.23): IKE carries the
+		// non-ESP marker from the first message, for gateways reachable
+		// only on 4500 (e.g. behind a load balancer).
+		if _, port := addrPort(conn.RemoteAddr()); port == natt.Port4500 {
+			s.nattMode = true
+		}
 	}
 
 	var err error
