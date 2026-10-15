@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/n0madic/go-ipsec/internal/esp"
 	"github.com/n0madic/go-ipsec/internal/session"
@@ -54,5 +55,21 @@ func TestRemoteTrafficSelectorsFollowRekey(t *testing.T) {
 	got[0] = netip.MustParsePrefix("0.0.0.0/0")
 	if !slices.Equal(c.RemoteTrafficSelectors(), want) {
 		t.Fatal("RemoteTrafficSelectors() exposed a mutable internal slice")
+	}
+}
+
+// Done is closed by Close.
+func TestDoneClosedByClose(t *testing.T) {
+	c := newClient(Config{Logger: discardLogger()})
+	select {
+	case <-c.Done():
+		t.Fatal("Done closed before Close")
+	default:
+	}
+	_ = c.Close()
+	select {
+	case <-c.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("Done not closed after Close")
 	}
 }

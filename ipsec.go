@@ -218,6 +218,13 @@ func (c *Client) LocalIP() netip.Addr {
 	return c.localIP
 }
 
+// Done returns a channel that is closed when the client shuts down: on Close,
+// or, with AutoReconnect disabled, when the IKE SA is declared dead and the
+// client tears itself down. It closes as Close begins, before the teardown
+// (graceful DELETE, netstack close) completes. With AutoReconnect enabled a
+// dead peer is redialled in place and Done stays open.
+func (c *Client) Done() <-chan struct{} { return c.superCtx.Done() }
+
 // RemoteTrafficSelectors returns the peer side of the current Child SA's
 // negotiated traffic selectors (the TSr the responder narrowed to, or the TSi a
 // responder-initiated rekey offered) as address prefixes: the source addresses
