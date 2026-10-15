@@ -81,6 +81,7 @@ type Client struct {
 	closed  bool             // guarded by mu; set by Close so a netstack() racing it closes its own result
 	onRekey []func()         // guarded by mu
 	localIP netip.Addr       // guarded by mu
+	peerTS  []netip.Prefix   // guarded by mu; the current Child SA's peer selectors
 	mgr     *workers.Manager // guarded by mu; swapped each generation by the supervisor
 
 	// Supervisor lifecycle. superCtx parents every generation's worker manager and
@@ -127,6 +128,7 @@ func Dial(ctx context.Context, cfg Config) (*Client, error) {
 	c.session.Store(sess)
 	c.mu.Lock()
 	c.localIP = sess.Assigned().IP
+	c.peerTS = sess.Child().PeerSelectors
 	c.mu.Unlock()
 	if err := c.startDataPlane(); err != nil {
 		_ = sess.Close()
@@ -214,6 +216,18 @@ func (c *Client) LocalIP() netip.Addr {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.localIP
+}
+
+// RemoteTrafficSelectors returns the peer side of the current Child SA's
+// negotiated traffic selectors (the TSr the responder narrowed to, or the TSi a
+// responder-initiated rekey offered) as address prefixes: the source addresses
+// the peer may send through the tunnel. Protocol and port ranges are not
+// represented. It is refreshed on every Child SA rekey (before OnRekey
+// callbacks run) and on reconnect, and is nil before the first handshake.
+func (c *Client) RemoteTrafficSelectors() []netip.Prefix {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.Clone(c.peerTS)
 }
 
 // DNS returns the IPv4 resolvers the responder pushed via the configuration

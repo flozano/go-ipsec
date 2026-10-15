@@ -155,6 +155,7 @@ Other handles on `*Client`:
 | `Net()` | the internal `*tun2net.Net` stack. |
 | `Tunnel()` | the raw `PacketTunnel` for wiring a custom `go-tun2net` stack. |
 | `LocalIP()` / `LocalIP6()` | the inner v4 address / v6 prefix the responder assigned. |
+| `RemoteTrafficSelectors()` | the peer side of the negotiated traffic selectors, as prefixes (the sources the peer may send from); refreshed on rekey and reconnect. |
 | `DNS()` / `DNS6()` | the responder-pushed v4 / v6 resolver addresses. |
 | `OnRekey(fn)` | register a callback fired after every successful rekey. |
 | `RxDrops()` | count of inbound ESP packets dropped by decrypt/replay failures. |

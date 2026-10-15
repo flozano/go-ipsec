@@ -27,6 +27,10 @@ type ChildSA struct {
 	ResponderSPI uint32 // responder SPI (we send to it)
 	Suite        esp.Suite
 	Keys         ikesa.ChildKeys
+	// PeerSelectors are the peer side's negotiated traffic selectors (the
+	// responder's TSr from IKE_AUTH), as address prefixes: the sources the
+	// peer may send through this Child SA.
+	PeerSelectors []netip.Prefix
 }
 
 // Assigned is the layer-3 configuration the responder pushed via the CFG payload.
@@ -330,6 +334,8 @@ func (s *Session) handleFinalAuthResponse(payloads ikemsg.Payloads, secret []byt
 		ResponderSPI: binary.BigEndian.Uint32(prop.SPI),
 		Suite:        suite.id,
 		Keys:         s.ikeSA.DeriveChildKeys(s.nonceI, s.nonceR, suite.encrKeyLen, suite.integKeyLen),
+		// We initiated, so the responder's side is TSr.
+		PeerSelectors: selectorPrefixes(tsr),
 	}
 	if cp != nil {
 		s.assigned = parseCPReply(cp)

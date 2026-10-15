@@ -293,6 +293,10 @@ func (c *Client) InstallChildSA(u session.ChildSAUpdate) {
 	// must NOT fire OnReconfigure (which the netstack treats as a re-address and
 	// would tear down active connections).
 	c.tun.SwapSA(sa)
+	// Before fireRekey, so OnRekey callbacks see the new SA's selectors.
+	c.mu.Lock()
+	c.peerTS = u.PeerSelectors
+	c.mu.Unlock()
 	c.fireRekey()
 	c.cfg.Logger.Info("Child SA rekeyed",
 		"newInSPI", u.NewInSPI, "newOutSPI", u.NewOutSPI, "oldInSPI", u.OldInSPI, "suite", u.Suite)

@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"math/big"
 	"net/netip"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -372,6 +373,10 @@ func TestOfflineHandshakePSK(t *testing.T) {
 	if !bytes.Equal(child.Keys.EncrIR, res.childKeys.EncrIR) ||
 		!bytes.Equal(child.Keys.IntegRI, res.childKeys.IntegRI) {
 		t.Fatal("child SA key material disagrees across initiator/responder")
+	}
+	// The responder answered with full-range v4 selectors; its side is the TSr.
+	if want := []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")}; !slices.Equal(child.PeerSelectors, want) {
+		t.Fatalf("PeerSelectors = %v, want %v", child.PeerSelectors, want)
 	}
 }
 

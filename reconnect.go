@@ -106,6 +106,7 @@ func (c *Client) reconnect() {
 	c.session.Store(sess)
 	c.mu.Lock()
 	c.localIP = sess.Assigned().IP
+	c.peerTS = child.PeerSelectors
 	c.mu.Unlock()
 
 	// (6) Re-address the netstack in place (force-closing stale connections) and

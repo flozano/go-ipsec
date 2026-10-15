@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"net/netip"
 	"time"
 
 	"github.com/n0madic/go-ipsec/internal/esp"
@@ -42,6 +43,9 @@ type ChildSAUpdate struct {
 	OutInteg  []byte
 	InEncr    []byte
 	InInteg   []byte
+	// PeerSelectors are the peer side's traffic selectors for the new SA, as
+	// address prefixes (see ChildSA.PeerSelectors).
+	PeerSelectors []netip.Prefix
 }
 
 // SetDataPlane wires the ESP data-plane controller used for rekey cutovers.
@@ -231,13 +235,20 @@ func (s *Session) completeChildRekey(ctx context.Context, inner ikemsg.Payloads,
 		}
 		keys = s.ikeSA.DeriveChildKeys(p.child.ni, nr, suite.encrKeyLen, suite.integKeyLen)
 	}
+	// We initiated, so the responder's side is TSr. A response without
+	// selectors keeps the ones already negotiated.
+	peerTS := s.child.PeerSelectors
+	if _, tsr := trafficSelectors(inner); len(tsr) > 0 {
+		peerTS = selectorPrefixes(tsr)
+	}
 	s.dataPlane.InstallChildSA(ChildSAUpdate{
 		NewInSPI: p.child.newInSPI, NewOutSPI: respSPI, OldInSPI: p.child.oldInSPI,
 		Suite:   suite.id,
 		OutEncr: keys.EncrIR, OutInteg: keys.IntegIR,
 		InEncr: keys.EncrRI, InInteg: keys.IntegRI,
+		PeerSelectors: peerTS,
 	})
-	s.child = &ChildSA{InitiatorSPI: p.child.newInSPI, ResponderSPI: respSPI, Suite: suite.id, Keys: keys}
+	s.child = &ChildSA{InitiatorSPI: p.child.newInSPI, ResponderSPI: respSPI, Suite: suite.id, Keys: keys, PeerSelectors: peerTS}
 	s.childInstalledAt = time.Now()
 	// A peer DELETE of the SA this rekey just replaced may have queued a
 	// re-establishment while the exchange was in flight (window size 1). The
@@ -388,13 +399,21 @@ func (s *Session) handleChildRekeyRequest(ctx context.Context, hdr *ikemsg.Messa
 		keys = dec.sa.DeriveChildKeys(ni, nr, suite.encrKeyLen, suite.integKeyLen)
 	}
 	oldInSPI := s.child.InitiatorSPI
+	// The peer initiated this exchange, so its side is the TSi it offered, which
+	// the response echoes. A request without selectors keeps the ones already
+	// negotiated.
+	peerTS := s.child.PeerSelectors
+	if len(reqTSi) > 0 && len(reqTSr) > 0 {
+		peerTS = selectorPrefixes(reqTSi)
+	}
 	s.dataPlane.InstallChildSA(ChildSAUpdate{
 		NewInSPI: binary.BigEndian.Uint32(newSPI), NewOutSPI: serverNewSPI, OldInSPI: oldInSPI,
 		Suite:   suite.id,
 		OutEncr: keys.EncrRI, OutInteg: keys.IntegRI,
 		InEncr: keys.EncrIR, InInteg: keys.IntegIR,
+		PeerSelectors: peerTS,
 	})
-	s.child = &ChildSA{InitiatorSPI: binary.BigEndian.Uint32(newSPI), ResponderSPI: serverNewSPI, Suite: suite.id, Keys: keys}
+	s.child = &ChildSA{InitiatorSPI: binary.BigEndian.Uint32(newSPI), ResponderSPI: serverNewSPI, Suite: suite.id, Keys: keys, PeerSelectors: peerTS}
 	s.childInstalledAt = time.Now()
 	// A server-driven install resets the soft lifetime; push our own next-Child-
 	// rekey deadline out from the new install time (otherwise it stays armed on the
