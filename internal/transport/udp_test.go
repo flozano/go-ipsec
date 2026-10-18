@@ -248,3 +248,20 @@ func TestRecvAcceptsOnlyTheServerPort(t *testing.T) {
 		t.Fatalf("got %q from the previous port after the grace period", got)
 	}
 }
+
+// Resolving the server name honours the caller's context.
+func TestDialUDPResolveHonoursContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := DialUDP(ctx, nil, "udp", "vpn.example.invalid:500"); err == nil {
+		t.Fatal("DialUDP resolved a name with a cancelled context")
+	}
+	conn, err := DialUDP(context.Background(), nil, "udp", "127.0.0.1:4500")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if got := conn.RemoteAddr().String(); got != "127.0.0.1:4500" {
+		t.Fatalf("remote = %s", got)
+	}
+}

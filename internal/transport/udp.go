@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/netip"
 	"strconv"
 	"sync/atomic"
 	"time"
@@ -61,7 +62,7 @@ func (u *udpConn) MigrateToPort(port int) {
 // DialUDP resolves serverAddr and opens a datagram socket to it. When dial is
 // nil a host UDP socket is used. network is typically "udp".
 func DialUDP(ctx context.Context, dial DialFunc, network, serverAddr string) (Conn, error) {
-	remote, err := net.ResolveUDPAddr(network, serverAddr)
+	remote, err := resolveUDP(ctx, network, serverAddr)
 	if err != nil {
 		return nil, fmt.Errorf("transport: resolve %q: %w", serverAddr, err)
 	}
@@ -180,6 +181,42 @@ func (u *udpConn) Close() error {
 		return nil
 	}
 	return u.pc.Close()
+}
+
+// resolveUDP is net.ResolveUDPAddr bounded by ctx, so a slow DNS lookup
+// can't outlast the caller's connect timeout.
+func resolveUDP(ctx context.Context, network, addr string) (*net.UDPAddr, error) {
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	port, err := net.DefaultResolver.LookupPort(ctx, network, portStr)
+	if err != nil {
+		return nil, err
+	}
+	ipNet := "ip"
+	switch network {
+	case "udp4":
+		ipNet = "ip4"
+	case "udp6":
+		ipNet = "ip6"
+	}
+	ips, err := net.DefaultResolver.LookupNetIP(ctx, ipNet, host)
+	if err != nil {
+		return nil, err
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("no addresses for %q", host)
+	}
+	// Prefer IPv4, as net.ResolveUDPAddr does for "udp".
+	pick := ips[0]
+	for _, ip := range ips {
+		if ip.Is4() || ip.Is4In6() {
+			pick = ip
+			break
+		}
+	}
+	return net.UDPAddrFromAddrPort(netip.AddrPortFrom(pick.Unmap(), uint16(port))), nil
 }
 
 // fromServer reports whether src is the server: its host and current port,
