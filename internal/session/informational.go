@@ -392,22 +392,17 @@ func (s *Session) housekeeping(ctx context.Context, onDead func()) (exit bool) {
 		if now.After(s.pending.nextRetransmit) {
 			s.pending.attempts++
 			if s.pending.attempts > s.pendingTries() {
+				// Any request that exhausts its retransmits fails the IKE SA
+				// (RFC 7296 §2.1), not just a DPD probe. Abandoning a rekey or
+				// DELETE and moving on to the next Message ID would desynchronize
+				// the window: the peer still waits for the old ID and silently
+				// ignores every later request, while ESP keeps the tunnel looking
+				// alive until the peer's Child SA expires.
 				kind := s.pending.kind
-				// A re-establishment (peer DELETEd the live Child SA) that goes
-				// unanswered must keep being retried — otherwise the data plane is
-				// left dead. Re-queue it for housekeeping with a backoff.
-				reestablish := s.pending.child != nil && s.pending.child.reestablish
 				s.pending = nil
-				if kind == exDPD {
-					s.log.Warn("DPD: peer unresponsive, declaring dead")
-					onDead()
-					return true
-				}
-				s.log.Warn("driver: exchange unanswered, abandoning", "kind", kind)
-				if reestablish {
-					s.childReestablish = true
-					s.nextChildReestablish = now.Add(rekeyRetryInterval)
-				}
+				s.log.Warn("peer unresponsive, declaring dead", "kind", kind)
+				onDead()
+				return true
 			} else {
 				s.pending.nextRetransmit = now.Add(s.pendingBackoff(s.pending.attempts))
 				_ = s.sendDatagram(ctx, s.pending.raw)

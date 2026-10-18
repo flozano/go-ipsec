@@ -437,34 +437,40 @@ func TestChildRekeyResponderInstallsBeforeSend(t *testing.T) {
 	}
 }
 
-// TestReestablishRetriedAfterAbandon pins finding #1: a re-establishment that
-// exhausts its retransmits must be re-queued (childReestablish set, backoff armed)
-// so the data plane is not left dead.
-func TestReestablishRetriedAfterAbandon(t *testing.T) {
-	initS, _, _ := mirrorSessions(t)
-	initS.child = &ChildSA{InitiatorSPI: 0x1111, ResponderSPI: 0x2222}
-	initS.SetDataPlane(&fakeDataPlane{})
-	initS.lastInbound = time.Now()
-	initS.pending = &pendingExchange{
-		kind:           exChildRekey,
-		child:          &childRekeyCtx{reestablish: true},
-		attempts:       initS.retransmitTries(),
-		nextRetransmit: time.Now().Add(-time.Second),
-	}
+// TestUnansweredRequestDeclaresDead: a rekey, re-establishment or DELETE that
+// exhausts its retransmits must fail the IKE SA like an unanswered DPD does.
+// Abandoning it and moving on to the next Message ID would leave the peer waiting
+// for the old ID and ignoring every later request (RFC 7296 §2.1).
+func TestUnansweredRequestDeclaresDead(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		p    *pendingExchange
+	}{
+		{"child rekey", &pendingExchange{kind: exChildRekey, child: &childRekeyCtx{}}},
+		{"re-establishment", &pendingExchange{kind: exChildRekey, child: &childRekeyCtx{reestablish: true}}},
+		{"IKE rekey", &pendingExchange{kind: exIKERekey}},
+		{"DPD", &pendingExchange{kind: exDPD}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			initS, _, _ := mirrorSessions(t)
+			initS.child = &ChildSA{InitiatorSPI: 0x1111, ResponderSPI: 0x2222}
+			initS.SetDataPlane(&fakeDataPlane{})
+			initS.lastInbound = time.Now()
+			tc.p.attempts = initS.retransmitTries()
+			tc.p.nextRetransmit = time.Now().Add(-time.Second)
+			initS.pending = tc.p
+			nextID := initS.messageID
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	if exit := initS.housekeeping(ctx, func() {}); exit {
-		t.Fatal("unexpected exit")
-	}
-	if initS.pending != nil {
-		t.Fatal("abandoned exchange not cleared")
-	}
-	if !initS.childReestablish {
-		t.Fatal("abandoned re-establishment was not re-queued for retry")
-	}
-	if initS.nextChildReestablish.IsZero() {
-		t.Fatal("re-establishment retry backoff not armed")
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			dead := false
+			if exit := initS.housekeeping(ctx, func() { dead = true }); !exit || !dead {
+				t.Fatalf("exit=%v dead=%v, want the peer declared dead", exit, dead)
+			}
+			if initS.messageID != nextID {
+				t.Fatalf("a new request was sent after the failure (messageID %d -> %d)", nextID, initS.messageID)
+			}
+		})
 	}
 }
 
