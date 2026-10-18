@@ -64,6 +64,9 @@ type Client struct {
 	// policy its decrypted packets must satisfy (see innerPolicy).
 	inbound   atomic.Pointer[map[uint32]inboundSA]
 	inboundMu sync.Mutex
+	// pendingOut is a rekeyed Child SA installed for inbound only, waiting to
+	// become the outbound SA (see session.ChildSAUpdate.DeferOutbound).
+	pendingOut atomic.Pointer[pendingOutbound]
 
 	// lastDataInbound is the UnixNano time of the most recent decrypted inbound
 	// ESP packet, read by the session driver so DPD counts data-plane liveness

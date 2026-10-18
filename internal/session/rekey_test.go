@@ -16,11 +16,13 @@ type fakeDataPlane struct {
 	updates    []ChildSAUpdate
 	lastInData time.Time
 	volume     uint32
+	commits    int
 }
 
 func (f *fakeDataPlane) InstallChildSA(u ChildSAUpdate) { f.updates = append(f.updates, u) }
 func (f *fakeDataPlane) LastDataInbound() time.Time     { return f.lastInData }
 func (f *fakeDataPlane) ChildSAVolume() uint32          { return f.volume }
+func (f *fakeDataPlane) CommitOutbound()                { f.commits++ }
 
 func recvCtx(t *testing.T) (context.Context, context.CancelFunc) {
 	t.Helper()
@@ -177,6 +179,9 @@ func TestChildRekeyResponder(t *testing.T) {
 	u := initDP.updates[0]
 	if u.NewOutSPI != 0xABCDEF01 || u.OldInSPI != 0x1111 {
 		t.Fatalf("install SPIs wrong: out=%08x old=%08x", u.NewOutSPI, u.OldInSPI)
+	}
+	if !u.DeferOutbound {
+		t.Fatal("a rekey the peer initiated must defer the outbound switch")
 	}
 
 	// Read our response (sent to the peer conn) and extract our Nr / new SPI to
@@ -2246,5 +2251,39 @@ func TestServerIKERekeyGroupNotOffered(t *testing.T) {
 	}
 	if len(grp) != 2 || binary.BigEndian.Uint16(grp) != ikemsg.DH_X25519 {
 		t.Fatalf("INVALID_KE_PAYLOAD did not carry group 31: %v", grp)
+	}
+}
+
+// The peer deleting the SA it just rekeyed away commits a deferred outbound
+// switch; a DELETE of the live SA does not (it re-establishes instead).
+func TestOldChildDeleteCommitsOutbound(t *testing.T) {
+	initS, respS, respConn := mirrorSessions(t)
+	initS.child = &ChildSA{InitiatorSPI: 0x1111, ResponderSPI: 0x2222}
+	initDP := &fakeDataPlane{}
+	initS.SetDataPlane(initDP)
+	ctx, cancel := recvCtx(t)
+	defer cancel()
+
+	reqRaw := serverChildRekey(t, respS, 5, []byte{0, 0, 0x22, 0x22}, []byte{0xAB, 0xCD, 0xEF, 0x01}, bytes.Repeat([]byte{0xC1}, nonceLen))
+	if exit := initS.handleInbound(ctx, reqRaw, func() {}); exit {
+		t.Fatal("unexpected teardown")
+	}
+	if _, err := respConn.Recv(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if initDP.commits != 0 {
+		t.Fatal("outbound committed before the peer deleted the old SA")
+	}
+
+	del, err := encodeSKWith(respS.ikeSA, respS.initiatorSPI, respS.responderSPI, ikemsg.ExchangeInformational, 0, 6,
+		ikemsg.Payloads{&ikemsg.DeletePayload{Protocol: ikemsg.ProtocolESP, SPIs: [][]byte{{0, 0, 0x22, 0x22}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exit := initS.handleInbound(ctx, del, func() {}); exit {
+		t.Fatal("unexpected teardown")
+	}
+	if initDP.commits != 1 {
+		t.Fatalf("commits = %d after the old SA's DELETE, want 1", initDP.commits)
 	}
 }

@@ -339,6 +339,9 @@ func (s *Session) handleInboundChildDelete(ctx context.Context, d *ikemsg.Delete
 		return
 	}
 	if !deleteRefsChild(d, s.child) {
+		// The peer deleting a superseded SA after a rekey it initiated: it now
+		// sends and receives on the new one, so outbound can follow.
+		s.dataPlane.CommitOutbound()
 		return
 	}
 	// Re-establish a fresh Child SA. Do NOT nil s.child — initiateChildRekey

@@ -22,6 +22,10 @@ const ikeRekeyGrace = 30 * time.Second
 // ipsec.Client.
 type DataPlane interface {
 	InstallChildSA(u ChildSAUpdate)
+	// CommitOutbound switches outbound traffic to a Child SA installed with
+	// DeferOutbound, if one is still waiting. The driver calls it when the peer
+	// deletes the superseded SA.
+	CommitOutbound()
 	// LastDataInbound reports when the most recent inbound ESP packet arrived
 	// (zero time if none), so DPD treats a data-busy tunnel as alive.
 	LastDataInbound() time.Time
@@ -46,6 +50,13 @@ type ChildSAUpdate struct {
 	// PeerSelectors are the peer side's traffic selectors for the new SA, as
 	// address prefixes (see ChildSA.PeerSelectors).
 	PeerSelectors []netip.Prefix
+	// DeferOutbound installs the new SA for inbound only, keeping outbound on
+	// the old SA until the peer shows it has the new one: when we answer a
+	// rekey the peer initiated, it can't derive the new keys until our response
+	// arrives, so anything sent on the new SA before then is dropped. Outbound
+	// switches on the first packet received on the new SA, on the peer's DELETE
+	// of the old SA (CommitOutbound), or when the old inbound SA's grace ends.
+	DeferOutbound bool
 }
 
 // SetDataPlane wires the ESP data-plane controller used for rekey cutovers.
@@ -408,6 +419,7 @@ func (s *Session) handleChildRekeyRequest(ctx context.Context, hdr *ikemsg.Messa
 		OutEncr: keys.EncrRI, OutInteg: keys.IntegRI,
 		InEncr: keys.EncrIR, InInteg: keys.IntegIR,
 		PeerSelectors: peerTS,
+		DeferOutbound: true,
 	})
 	s.child = &ChildSA{InitiatorSPI: binary.BigEndian.Uint32(newSPI), ResponderSPI: serverNewSPI, Suite: suite.id, Keys: keys, PeerSelectors: peerTS}
 	s.childInstalledAt = time.Now()

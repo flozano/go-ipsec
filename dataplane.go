@@ -135,8 +135,28 @@ func (c *Client) resetInbound(spi uint32, sa *esp.SA) {
 	e := inboundSA{sa: sa, policy: c.innerPolicy(peer)}
 	c.inboundMu.Lock()
 	c.inbound.Store(&map[uint32]inboundSA{spi: e})
+	c.pendingOut.Store(nil) // the caller sets the outbound SA itself
 	c.inboundMu.Unlock()
 }
+
+// pendingOutbound is a Child SA waiting to become the outbound SA, keyed by
+// its inbound SPI.
+type pendingOutbound struct {
+	inSPI uint32
+	sa    *esp.SA
+}
+
+// commitOutbound makes p the outbound SA if it is still the one waiting.
+func (c *Client) commitOutbound(p *pendingOutbound) {
+	if p != nil && c.pendingOut.CompareAndSwap(p, nil) {
+		c.tun.SwapSA(p.sa)
+		c.cfg.Logger.Debug("rekey: outbound switched to the new Child SA", "inSPI", p.inSPI)
+	}
+}
+
+// CommitOutbound switches outbound to the waiting Child SA, if any. It
+// implements session.DataPlane.
+func (c *Client) CommitOutbound() { c.commitOutbound(c.pendingOut.Load()) }
 
 // inboundSA is an inbound Child SA and the policy its packets must satisfy.
 type inboundSA struct {
@@ -309,6 +329,10 @@ func (c *Client) rxLoop(ctx context.Context, recv func(context.Context) ([]byte,
 			// Authenticated, so it proves the peer is alive even if the packet
 			// itself is then refused.
 			c.lastDataInbound.Store(time.Now().UnixNano())
+			// The peer sending on a rekeyed SA proves it has installed it.
+			if p := c.pendingOut.Load(); p != nil && p.inSPI == spi {
+				c.commitOutbound(p)
+			}
 			if !e.policy.allows(inner) {
 				c.rxDrops.Add(1)
 				continue
@@ -408,10 +432,18 @@ func (c *Client) InstallChildSA(u session.ChildSAUpdate) {
 	c.inbound.Store(&next)
 	c.inboundMu.Unlock()
 
-	// Atomic outbound cutover. The layer-3 config is unchanged on rekey, so this
-	// must NOT fire OnReconfigure (which the netstack treats as a re-address and
-	// would tear down active connections).
-	c.tun.SwapSA(sa)
+	// Atomic outbound cutover, now or once the peer has the new SA. The layer-3
+	// config is unchanged on rekey, so this must NOT fire OnReconfigure (which
+	// the netstack treats as a re-address and would tear down active
+	// connections).
+	var pending *pendingOutbound
+	if u.DeferOutbound {
+		pending = &pendingOutbound{inSPI: u.NewInSPI, sa: sa}
+		c.pendingOut.Store(pending)
+	} else {
+		c.pendingOut.Store(nil) // superseded by this SA
+		c.tun.SwapSA(sa)
+	}
 	// Before fireRekey, so OnRekey callbacks see the new SA's selectors.
 	c.mu.Lock()
 	c.peerTS = u.PeerSelectors
@@ -424,16 +456,19 @@ func (c *Client) InstallChildSA(u session.ChildSAUpdate) {
 	// removing it would delete the inbound SA just installed above, black-holing
 	// inbound ESP until the next rekey.
 	if u.OldInSPI != 0 && u.OldInSPI != u.NewInSPI {
-		c.scheduleInboundRemoval(u.OldInSPI, superseded)
+		c.scheduleInboundRemoval(u.OldInSPI, superseded, pending)
 	}
 }
 
 // scheduleInboundRemoval drops the superseded inbound SA (the exact sa pointer)
 // after the grace period; the identity check in removeInbound ensures a later
-// rekey reusing the same SPI is not evicted by this timer.
-func (c *Client) scheduleInboundRemoval(spi uint32, sa *esp.SA) {
+// rekey reusing the same SPI is not evicted by this timer. A deferred outbound
+// switch still waiting by then (pending, may be nil) happens now: the peer has
+// had the whole grace period to finish the rekey.
+func (c *Client) scheduleInboundRemoval(spi uint32, sa *esp.SA, pending *pendingOutbound) {
 	var t *time.Timer
 	t = time.AfterFunc(childSAGrace, func() {
+		c.commitOutbound(pending)
 		c.removeInbound(spi, sa)
 		// Prune the fired timer so graceTimers doesn't grow without bound over a
 		// long-lived tunnel's rekeys (it is otherwise only cleared on Close/reconnect).
