@@ -76,6 +76,11 @@ func Parse(raw []byte) (*Message, error) {
 	if len(raw) != int(length) {
 		return nil, fmt.Errorf("ikemsg: datagram length %d does not match header length %d", len(raw), length)
 	}
+	// RFC 7296 §3.1: a message with a major version above 2 must be dropped,
+	// and one below it (IKEv1) is not IKEv2 at all.
+	if major := raw[17] >> 4; major != 2 {
+		return nil, fmt.Errorf("ikemsg: IKE major version %d, want 2", major)
+	}
 
 	m := &Message{
 		InitiatorSPI: binary.BigEndian.Uint64(raw[0:8]),

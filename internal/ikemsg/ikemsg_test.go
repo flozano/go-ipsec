@@ -746,3 +746,20 @@ func TestMarshalRejectsKeyLengthWithoutFlag(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestParseRejectsOtherMajorVersions(t *testing.T) {
+	raw, err := (&Message{InitiatorSPI: 1, Exchange: ExchangeIKESAInit}).Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Parse(raw); err != nil {
+		t.Fatalf("version 2: %v", err)
+	}
+	for _, v := range []byte{0x10, 0x30, 0x00} {
+		bad := append([]byte(nil), raw...)
+		bad[17] = v
+		if _, err := Parse(bad); err == nil {
+			t.Errorf("version byte %#x accepted", v)
+		}
+	}
+}
