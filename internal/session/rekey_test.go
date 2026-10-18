@@ -17,12 +17,16 @@ type fakeDataPlane struct {
 	lastInData time.Time
 	volume     uint32
 	commits    int
+	used       []uint32
+	retired    []uint32
 }
 
 func (f *fakeDataPlane) InstallChildSA(u ChildSAUpdate) { f.updates = append(f.updates, u) }
 func (f *fakeDataPlane) LastDataInbound() time.Time     { return f.lastInData }
 func (f *fakeDataPlane) ChildSAVolume() uint32          { return f.volume }
 func (f *fakeDataPlane) CommitOutbound()                { f.commits++ }
+func (f *fakeDataPlane) UseOutbound(spi uint32)         { f.used = append(f.used, spi) }
+func (f *fakeDataPlane) RetireInbound(spi uint32)       { f.retired = append(f.retired, spi) }
 
 func recvCtx(t *testing.T) (context.Context, context.CancelFunc) {
 	t.Helper()
@@ -72,7 +76,8 @@ func TestChildRekeyInitiatorRoundTrip(t *testing.T) {
 	initS, respS, respConn := mirrorSessions(t)
 	initConn := initS.conn
 	initS.child = &ChildSA{InitiatorSPI: 0x1111, ResponderSPI: 0x2222}
-	respS.child = &ChildSA{InitiatorSPI: 0x1111, ResponderSPI: 0x2222}
+	// The peer's own view of the SA: its outbound SPI is our inbound one.
+	respS.child = &ChildSA{InitiatorSPI: 0x2222, ResponderSPI: 0x1111}
 	initDP, respDP := &fakeDataPlane{}, &fakeDataPlane{}
 	initS.SetDataPlane(initDP)
 	respS.SetDataPlane(respDP)
@@ -379,57 +384,6 @@ func TestIKERekeyRequestRetransmitIdempotent(t *testing.T) {
 	}
 }
 
-// TestSimultaneousRekeyRejected checks that a server CREATE_CHILD_SA request
-// arriving while our own rekey is pending is declined with TEMPORARY_FAILURE
-// instead of installing a second, redundant Child SA.
-func TestSimultaneousRekeyRejected(t *testing.T) {
-	initS, respS, respConn := mirrorSessions(t)
-	initS.child = &ChildSA{InitiatorSPI: 0x1111, ResponderSPI: 0x2222}
-	initDP := &fakeDataPlane{}
-	initS.SetDataPlane(initDP)
-
-	ctx, cancel := recvCtx(t)
-	defer cancel()
-
-	// Our own Child rekey is in flight.
-	if err := initS.initiateChildRekey(ctx, false); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := respConn.Recv(ctx); err != nil { // drain our request
-		t.Fatal(err)
-	}
-
-	// Server initiates its own Child rekey concurrently (I bit clear, msgID 7).
-	serverNi := bytes.Repeat([]byte{0xC2}, nonceLen)
-	reqRaw := serverChildRekey(t, respS, 7, []byte{0, 0, 0x22, 0x22}, []byte{0xAB, 0xCD, 0xEF, 0x02}, serverNi)
-
-	if exit := initS.handleInbound(ctx, reqRaw, func() {}); exit {
-		t.Fatal("unexpected teardown")
-	}
-	// We must NOT have installed a Child SA for the colliding request.
-	if len(initDP.updates) != 0 {
-		t.Fatalf("expected no install on collision, got %d", len(initDP.updates))
-	}
-	// The reply must be a TEMPORARY_FAILURE notify.
-	raw, err := respConn.Recv(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, respInner, _, err := respS.decodeIKE(raw)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var sawTempFail bool
-	for _, p := range respInner {
-		if n, ok := p.(*ikemsg.NotifyPayload); ok && n.Type == ikemsg.NotifyTemporaryFailure {
-			sawTempFail = true
-		}
-	}
-	if !sawTempFail {
-		t.Fatal("collision reply was not TEMPORARY_FAILURE")
-	}
-}
-
 // TestResponderRoleDPDClearsInitiatorBit is finding #4: after a server-initiated
 // IKE rekey our new IKE SA has Role==Responder, so everything we originate under
 // it must CLEAR the I bit (RFC 7296 §3.1).
@@ -535,58 +489,6 @@ func TestServerIKERekeyRecomputesDeadline(t *testing.T) {
 	}
 	if initS.nextIKERekey.Before(before.Add(2 * time.Hour)) {
 		t.Fatalf("nextIKERekey re-armed too early: +%v", initS.nextIKERekey.Sub(before))
-	}
-}
-
-// TestTemporaryFailureCachedOnRetransmit is finding #7: a colliding server rekey
-// declined with TEMPORARY_FAILURE must be cached, so a retransmit resends the
-// cached notify instead of being reprocessed as a fresh rekey.
-func TestTemporaryFailureCachedOnRetransmit(t *testing.T) {
-	initS, respS, respConn := mirrorSessions(t)
-	initS.child = &ChildSA{InitiatorSPI: 0x1111, ResponderSPI: 0x2222}
-	initDP := &fakeDataPlane{}
-	initS.SetDataPlane(initDP)
-
-	ctx, cancel := recvCtx(t)
-	defer cancel()
-
-	// Our own Child rekey is in flight (collision precondition).
-	if err := initS.initiateChildRekey(ctx, false); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := respConn.Recv(ctx); err != nil { // drain our request
-		t.Fatal(err)
-	}
-
-	// Server initiates a colliding Child rekey (I bit clear, msgID 7).
-	serverNi := bytes.Repeat([]byte{0xC7}, nonceLen)
-	reqRaw := serverChildRekey(t, respS, 7, []byte{0, 0, 0x22, 0x22}, []byte{0xAB, 0xCD, 0xEF, 0x07}, serverNi)
-
-	// First delivery: declined with TEMPORARY_FAILURE, cached in peer dedup.
-	if exit := initS.handleInbound(ctx, reqRaw, func() {}); exit {
-		t.Fatal("unexpected teardown")
-	}
-	resp1, err := respConn.Recv(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !initS.peer.set || initS.peer.msgID != 7 {
-		t.Fatal("TEMPORARY_FAILURE response was not cached in peer dedup")
-	}
-
-	// Retransmit the same request: must resend the cached bytes, not reprocess.
-	if exit := initS.handleInbound(ctx, reqRaw, func() {}); exit {
-		t.Fatal("unexpected teardown on retransmit")
-	}
-	resp2, err := respConn.Recv(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(resp1, resp2) {
-		t.Fatal("retransmit produced a different response (collision reprocessed)")
-	}
-	if len(initDP.updates) != 0 {
-		t.Fatalf("collision must not install a Child SA, got %d", len(initDP.updates))
 	}
 }
 
@@ -1166,7 +1068,8 @@ func TestChildRekeyInitiatorPFSRoundTrip(t *testing.T) {
 	initS, respS, respConn := mirrorSessions(t)
 	initConn := initS.conn
 	initS.child = &ChildSA{InitiatorSPI: 0x1111, ResponderSPI: 0x2222}
-	respS.child = &ChildSA{InitiatorSPI: 0x1111, ResponderSPI: 0x2222}
+	// The peer's own view of the SA: its outbound SPI is our inbound one.
+	respS.child = &ChildSA{InitiatorSPI: 0x2222, ResponderSPI: 0x1111}
 	initS.childPFS = true // offer PFS on our initiated rekey
 	initDP, respDP := &fakeDataPlane{}, &fakeDataPlane{}
 	initS.SetDataPlane(initDP)
@@ -1470,7 +1373,8 @@ func TestChildRekeyInitiatorX25519RoundTrip(t *testing.T) {
 	initS, respS, respConn := mirrorSessions(t)
 	initConn := initS.conn
 	initS.child = &ChildSA{InitiatorSPI: 0x1111, ResponderSPI: 0x2222}
-	respS.child = &ChildSA{InitiatorSPI: 0x1111, ResponderSPI: 0x2222}
+	// The peer's own view of the SA: its outbound SPI is our inbound one.
+	respS.child = &ChildSA{InitiatorSPI: 0x2222, ResponderSPI: 0x1111}
 	initS.childPFS = true
 	initS.childPFSGroup = ikemsg.DH_X25519 // offer x25519 on our rekey
 	initDP, respDP := &fakeDataPlane{}, &fakeDataPlane{}
@@ -1953,7 +1857,8 @@ func TestRekeyCompletionClearsQueuedReestablish(t *testing.T) {
 	initS, respS, respConn := mirrorSessions(t)
 	initConn := initS.conn
 	initS.child = &ChildSA{InitiatorSPI: 0x1111, ResponderSPI: 0x2222}
-	respS.child = &ChildSA{InitiatorSPI: 0x1111, ResponderSPI: 0x2222}
+	// The peer's own view of the SA: its outbound SPI is our inbound one.
+	respS.child = &ChildSA{InitiatorSPI: 0x2222, ResponderSPI: 0x1111}
 	initS.SetDataPlane(&fakeDataPlane{})
 	respS.SetDataPlane(&fakeDataPlane{})
 

@@ -1,6 +1,7 @@
 package session
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -26,6 +27,12 @@ type DataPlane interface {
 	// DeferOutbound, if one is still waiting. The driver calls it when the peer
 	// deletes the superseded SA.
 	CommitOutbound()
+	// UseOutbound makes the inbound Child SA registered under inSPI the
+	// outbound SA now (a simultaneous rekey resolved in its favour).
+	UseOutbound(inSPI uint32)
+	// RetireInbound removes the inbound Child SA under inSPI after the usual
+	// grace period (the redundant SA of a simultaneous rekey).
+	RetireInbound(inSPI uint32)
 	// LastDataInbound reports when the most recent inbound ESP packet arrived
 	// (zero time if none), so DPD treats a data-busy tunnel as alive.
 	LastDataInbound() time.Time
@@ -57,6 +64,85 @@ type ChildSAUpdate struct {
 	// switches on the first packet received on the new SA, on the peer's DELETE
 	// of the old SA (CommitOutbound), or when the old inbound SA's grace ends.
 	DeferOutbound bool
+	// InboundOnly installs the new SA for inbound only and touches nothing
+	// else: a peer-initiated rekey that collided with ours, kept until the
+	// collision is resolved (see rekeyedChild).
+	InboundOnly bool
+}
+
+// rekeyedChild is a Child SA a rekey exchange created, with that exchange's
+// nonces, kept to resolve simultaneous rekeys of the same SA (RFC 7296
+// §2.8.1): of the two new SAs, the one whose exchange holds the lowest of the
+// four nonces is redundant, and the side that initiated that exchange deletes
+// it.
+type rekeyedChild struct {
+	child  *ChildSA
+	ni, nr []byte
+	// replacedIn and replacedOut are our inbound and outbound SPIs of the SA
+	// the exchange rekeyed (the peer names replacedOut in N(REKEY_SA)).
+	replacedIn, replacedOut uint32
+	at                      time.Time
+}
+
+// lateCollisionWindow is how long after our rekey completes a peer rekey of
+// the SA it replaced is still treated as a simultaneous rekey, not an error.
+const lateCollisionWindow = 30 * time.Second
+
+// redundantOf reports whether exchange a, rather than b, created the
+// redundant SA: it holds the lowest of the four nonces.
+func redundantOf(a, b *rekeyedChild) bool {
+	return nonceLess(minNonce(a), minNonce(b))
+}
+
+func minNonce(r *rekeyedChild) []byte {
+	if nonceLess(r.nr, r.ni) {
+		return r.nr
+	}
+	return r.ni
+}
+
+// nonceLess compares nonces over the shorter length, as strongSwan does.
+func nonceLess(x, y []byte) bool {
+	n := min(len(x), len(y))
+	return bytes.Compare(x[:n], y[:n]) < 0
+}
+
+// rekeySAOf returns the SPI a CREATE_CHILD_SA request rekeys (N(REKEY_SA)):
+// the sender's inbound SPI, which is our outbound SPI.
+func rekeySAOf(inner ikemsg.Payloads) (uint32, bool) {
+	for _, p := range inner {
+		if n, ok := p.(*ikemsg.NotifyPayload); ok && n.Type == ikemsg.NotifyRekeySA && len(n.SPI) == 4 {
+			return binary.BigEndian.Uint32(n.SPI), true
+		}
+	}
+	return 0, false
+}
+
+// queueChildDelete sends a DELETE for one of our inbound Child SAs now, or
+// once the request window frees up.
+func (s *Session) queueChildDelete(ctx context.Context, inSPI uint32) {
+	if s.pending == nil {
+		if err := s.sendChildDelete(ctx, inSPI); err != nil {
+			s.log.Debug("Child SA DELETE send failed", "err", err)
+		}
+		return
+	}
+	s.deleteQueue = append(s.deleteQueue, inSPI)
+}
+
+// adoptPeerRekey switches to the SA of a peer rekey that collided with ours
+// when our own exchange failed: the peer's SA is the only replacement.
+func (s *Session) adoptPeerRekey() {
+	pr := s.peerRekey
+	if pr == nil {
+		return
+	}
+	s.peerRekey = nil
+	s.dataPlane.UseOutbound(pr.child.InitiatorSPI)
+	s.dataPlane.RetireInbound(pr.replacedIn)
+	s.child = pr.child
+	s.childInstalledAt = time.Now()
+	s.log.Info("simultaneous Child SA rekey: ours failed, keeping the peer's SA")
 }
 
 // SetDataPlane wires the ESP data-plane controller used for rekey cutovers.
@@ -249,6 +335,35 @@ func (s *Session) completeChildRekey(ctx context.Context, inner ikemsg.Payloads,
 	// We initiated, so the responder's side is TSr.
 	_, tsr := trafficSelectors(inner)
 	peerTS := s.rekeyedPeerSelectors(tsr)
+	ours := &ChildSA{InitiatorSPI: p.child.newInSPI, ResponderSPI: respSPI, Suite: suite.id, Keys: keys, PeerSelectors: peerTS}
+	ourRekey := &rekeyedChild{child: ours, ni: p.child.ni, nr: nr, replacedIn: p.child.oldInSPI, at: time.Now()}
+	if s.child != nil && s.child.InitiatorSPI == p.child.oldInSPI {
+		ourRekey.replacedOut = s.child.ResponderSPI
+	}
+	// The peer rekeyed the same SA while this exchange was in flight: the
+	// nonces decide which of the two new SAs survives (RFC 7296 §2.8.1).
+	if pr := s.peerRekey; pr != nil && pr.replacedIn == p.child.oldInSPI {
+		s.peerRekey = nil
+		if redundantOf(ourRekey, pr) {
+			// Ours is redundant: keep the peer's SA (it has had it since we
+			// answered) and delete ours, which we never installed. The peer,
+			// whose exchange won, deletes the old SA.
+			s.dataPlane.UseOutbound(pr.child.InitiatorSPI)
+			s.dataPlane.RetireInbound(p.child.oldInSPI)
+			s.child = pr.child
+			s.childInstalledAt = time.Now()
+			s.childReestablish = false
+			s.nextChildReestablish = time.Time{}
+			s.log.Info("simultaneous Child SA rekey: keeping the peer's SA, deleting ours",
+				"inSPI", pr.child.InitiatorSPI, "deleted", p.child.newInSPI)
+			return s.sendChildDelete(ctx, p.child.newInSPI)
+		}
+		// Ours survives; the peer deletes its redundant SA. Drop our inbound
+		// copy of it after the grace period.
+		defer s.dataPlane.RetireInbound(pr.child.InitiatorSPI)
+		s.log.Info("simultaneous Child SA rekey: keeping ours", "inSPI", p.child.newInSPI)
+	}
+	s.lastRekey = ourRekey
 	s.dataPlane.InstallChildSA(ChildSAUpdate{
 		NewInSPI: p.child.newInSPI, NewOutSPI: respSPI, OldInSPI: p.child.oldInSPI,
 		Suite:   suite.id,
@@ -256,7 +371,7 @@ func (s *Session) completeChildRekey(ctx context.Context, inner ikemsg.Payloads,
 		InEncr: keys.EncrRI, InInteg: keys.IntegRI,
 		PeerSelectors: peerTS,
 	})
-	s.child = &ChildSA{InitiatorSPI: p.child.newInSPI, ResponderSPI: respSPI, Suite: suite.id, Keys: keys, PeerSelectors: peerTS}
+	s.child = ours
 	s.childInstalledAt = time.Now()
 	// A peer DELETE of the SA this rekey just replaced may have queued a
 	// re-establishment while the exchange was in flight (window size 1). The
@@ -289,6 +404,23 @@ func (s *Session) handleChildRekeyRequest(ctx context.Context, hdr *ikemsg.Messa
 		s.sendNotifyResponse(ctx, dec, hdr.MessageID, viaOld, ikemsg.ProtocolESP, ikemsg.NotifyChildSANotFound, nil, "child rekey: no Child SA")
 		return errors.New("session: rekey request but no Child SA")
 	}
+	// Which SA the peer rekeys. Besides our current one it may be the SA our
+	// own just-completed rekey replaced, if the peer started before it saw ours:
+	// a simultaneous rekey we only learn of now (RFC 7296 §2.8.1).
+	rekeySPI, rekeying := rekeySAOf(inner)
+	late := false
+	if rekeying && rekeySPI != s.child.ResponderSPI {
+		if r := s.lastRekey; r != nil && rekeySPI == r.replacedOut && time.Since(r.at) < lateCollisionWindow {
+			late = true
+		} else {
+			s.sendNotifyResponse(ctx, dec, hdr.MessageID, viaOld, ikemsg.ProtocolESP, ikemsg.NotifyChildSANotFound, nil, "child rekey: unknown SA")
+			return fmt.Errorf("session: peer rekeys Child SA %08x, which we don't have", rekeySPI)
+		}
+	}
+	// Our own rekey of the same SA is in flight (RFC 7296 §2.25.1: answer as
+	// usual and resolve once both exchanges complete).
+	inFlight := rekeying && !late && s.pending != nil && s.pending.kind == exChildRekey &&
+		s.pending.child != nil && !s.pending.child.reestablish
 	saP, ni, ke, reqTSi, reqTSr, err := childRekeyRequestPayloads(inner)
 	if err != nil {
 		s.sendNotifyResponse(ctx, dec, hdr.MessageID, viaOld, ikemsg.ProtocolESP, ikemsg.NotifyNoProposalChosen, nil, "child rekey: no proposal chosen")
@@ -406,33 +538,74 @@ func (s *Session) handleChildRekeyRequest(ctx context.Context, hdr *ikemsg.Messa
 	} else {
 		keys = dec.sa.DeriveChildKeys(ni, nr, suite.encrKeyLen, suite.integKeyLen)
 	}
-	oldInSPI := s.child.InitiatorSPI
 	// The peer initiated this exchange, so its side is the TSi it offered, which
 	// the response echoes.
 	peerTS := s.child.PeerSelectors
 	if len(reqTSr) > 0 {
 		peerTS = s.rekeyedPeerSelectors(reqTSi)
 	}
-	s.dataPlane.InstallChildSA(ChildSAUpdate{
-		NewInSPI: binary.BigEndian.Uint32(newSPI), NewOutSPI: serverNewSPI, OldInSPI: oldInSPI,
+	newIn := binary.BigEndian.Uint32(newSPI)
+	theirs := &ChildSA{InitiatorSPI: newIn, ResponderSPI: serverNewSPI, Suite: suite.id, Keys: keys, PeerSelectors: peerTS}
+	update := ChildSAUpdate{
+		NewInSPI: newIn, NewOutSPI: serverNewSPI,
 		Suite:   suite.id,
 		OutEncr: keys.EncrRI, OutInteg: keys.IntegRI,
 		InEncr: keys.EncrIR, InInteg: keys.IntegIR,
 		PeerSelectors: peerTS,
-		DeferOutbound: true,
-	})
-	s.child = &ChildSA{InitiatorSPI: binary.BigEndian.Uint32(newSPI), ResponderSPI: serverNewSPI, Suite: suite.id, Keys: keys, PeerSelectors: peerTS}
-	s.childInstalledAt = time.Now()
-	// A server-driven install resets the soft lifetime; push our own next-Child-
-	// rekey deadline out from the new install time (otherwise it stays armed on the
-	// old time and we rekey again immediately).
-	s.nextChildRekey = jitteredDeadline(s.childInstalledAt, s.cfg.RekeyLifetime)
+	}
+	adopt := func(replacedIn uint32) {
+		update.OldInSPI = replacedIn
+		update.DeferOutbound = true
+		s.dataPlane.InstallChildSA(update)
+		s.child = theirs
+		s.childInstalledAt = time.Now()
+		// A server-driven install resets the soft lifetime; push our own next-Child-
+		// rekey deadline out from the new install time (otherwise it stays armed on the
+		// old time and we rekey again immediately).
+		s.nextChildRekey = jitteredDeadline(s.childInstalledAt, s.cfg.RekeyLifetime)
+	}
+	var afterSend func()
+	switch {
+	case inFlight:
+		// Keep the peer's SA inbound-only until our exchange completes and the
+		// nonces pick the survivor (completeChildRekey).
+		update.InboundOnly = true
+		s.dataPlane.InstallChildSA(update)
+		s.peerRekey = &rekeyedChild{child: theirs, ni: ni, nr: nr,
+			replacedIn: s.child.InitiatorSPI, replacedOut: s.child.ResponderSPI, at: time.Now()}
+		s.log.Info("simultaneous Child SA rekey: answering the peer's, resolving when ours completes")
+	case late:
+		ours := s.lastRekey
+		if redundantOf(ours, &rekeyedChild{ni: ni, nr: nr}) {
+			// Ours is redundant: switch to the peer's SA and delete ours once the
+			// peer has our answer.
+			s.lastRekey = nil
+			adopt(ours.child.InitiatorSPI)
+			afterSend = func() {
+				s.dataPlane.CommitOutbound()
+				s.queueChildDelete(ctx, ours.child.InitiatorSPI)
+			}
+			s.log.Info("simultaneous Child SA rekey (late): keeping the peer's SA, deleting ours",
+				"inSPI", newIn, "deleted", ours.child.InitiatorSPI)
+		} else {
+			// The peer's is redundant and the peer deletes it; keep ours.
+			update.InboundOnly = true
+			s.dataPlane.InstallChildSA(update)
+			s.dataPlane.RetireInbound(newIn)
+			s.log.Info("simultaneous Child SA rekey (late): keeping ours", "inSPI", ours.child.InitiatorSPI)
+		}
+	default:
+		adopt(s.child.InitiatorSPI)
+	}
 
 	// Cache before send so a retransmit resends this exact response instead of
 	// reprocessing (which would install a second SA).
 	s.recordPeerResponse(viaOld, hdr.MessageID, raw)
 	if err := s.sendDatagram(ctx, raw); err != nil {
 		return err
+	}
+	if afterSend != nil {
+		afterSend()
 	}
 	s.log.Debug("answered server Child SA rekey",
 		"newInSPI", binary.BigEndian.Uint32(newSPI), "suite", suite.name(), "pfs", pfsShared != nil)

@@ -143,14 +143,15 @@ func (s *Session) handleInbound(ctx context.Context, raw []byte, onDead func()) 
 		if s.dedupPeerRequest(ctx, hdr.MessageID, viaOld) {
 			return false
 		}
-		// Simultaneous rekey: if our own rekey is in flight, reject the peer's
-		// with TEMPORARY_FAILURE (RFC 7296 §2.25) rather than installing a second
-		// redundant SA and DELETEing the one the other half just installed.
-		if s.pending != nil && (s.pending.kind == exChildRekey || s.pending.kind == exIKERekey) {
+		ikeRekey := isIKERekey(inner)
+		// A rekey colliding with our IKE SA rekey, or an IKE rekey colliding with
+		// any rekey of ours, is declined with TEMPORARY_FAILURE (RFC 7296 §2.25);
+		// the peer retries. Two Child SA rekeys answer as usual and resolve by
+		// nonce (handleChildRekeyRequest, RFC 7296 §2.8.1).
+		if s.pending != nil && (s.pending.kind == exIKERekey || (ikeRekey && s.pending.kind == exChildRekey)) {
 			s.sendTemporaryFailure(ctx, dec, hdr.MessageID, viaOld)
 			return false
 		}
-		ikeRekey := isIKERekey(inner)
 		// A server IKE rekey arriving under the superseded SA during the grace
 		// window would force a SECOND cutover keyed from a dying SA, and its
 		// swapIKE (s.oldPeer = s.peer) would clobber the response cached for it —
@@ -275,6 +276,9 @@ func (s *Session) completeMatchingRekey(ctx context.Context, msgID uint32, inner
 	}
 	if err != nil {
 		s.log.Warn("driver: rekey completion failed", "kind", p.kind, "err", err)
+		if p.kind == exChildRekey {
+			s.adoptPeerRekey()
+		}
 	}
 }
 
@@ -413,6 +417,17 @@ func (s *Session) housekeeping(ctx context.Context, onDead func()) (exit bool) {
 			}
 		}
 		return false // window size 1: no new exchange while one is outstanding
+	}
+
+	// A DELETE queued while the window was busy (a simultaneous rekey's
+	// redundant SA).
+	if len(s.deleteQueue) > 0 {
+		spi := s.deleteQueue[0]
+		s.deleteQueue = s.deleteQueue[1:]
+		if err := s.sendChildDelete(ctx, spi); err != nil {
+			s.log.Debug("queued Child SA DELETE send failed", "err", err)
+		}
+		return false
 	}
 
 	// A fast DPD armed by a suspend/wake whose window was busy at the time: fire it

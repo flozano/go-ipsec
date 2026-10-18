@@ -127,6 +127,14 @@ type Session struct {
 	lastTickWall     time.Time // wall-clock of the previous housekeeping tick, for suspend/wake detection
 	fastDPDDue       bool      // a post-suspend fast DPD is armed, pending a free request window
 	childInstalledAt time.Time
+	// peerRekey is a peer rekey that collided with our in-flight one, kept
+	// inbound-only until ours completes; lastRekey is our latest completed
+	// rekey, for a peer rekey of the SA it replaced that arrives just after
+	// (both RFC 7296 §2.8.1).
+	peerRekey *rekeyedChild
+	lastRekey *rekeyedChild
+	// deleteQueue holds Child SA DELETEs waiting for the request window.
+	deleteQueue []uint32
 	// authPeerSelectors are the peer selectors IKE_AUTH negotiated. A Child SA
 	// rekey may narrow them but never widen past them.
 	authPeerSelectors []netip.Prefix

@@ -104,7 +104,8 @@ func TestChildRekeyInitiatorRecordsPeerTSr(t *testing.T) {
 	old := prefixes("192.0.2.10/32")
 	initS.authPeerSelectors = prefixes("0.0.0.0/0")
 	initS.child = &ChildSA{InitiatorSPI: 0x1111, ResponderSPI: 0x2222, PeerSelectors: old}
-	respS.child = &ChildSA{InitiatorSPI: 0x1111, ResponderSPI: 0x2222}
+	// The peer's own view of the SA: its outbound SPI is our inbound one.
+	respS.child = &ChildSA{InitiatorSPI: 0x2222, ResponderSPI: 0x1111}
 	initDP := &fakeDataPlane{}
 	initS.SetDataPlane(initDP)
 	respS.SetDataPlane(&fakeDataPlane{})

@@ -158,6 +158,31 @@ func (c *Client) commitOutbound(p *pendingOutbound) {
 // implements session.DataPlane.
 func (c *Client) CommitOutbound() { c.commitOutbound(c.pendingOut.Load()) }
 
+// UseOutbound makes the inbound Child SA under inSPI the outbound SA now. It
+// implements session.DataPlane.
+func (c *Client) UseOutbound(inSPI uint32) {
+	e, ok := c.lookupInboundEntry(inSPI)
+	if !ok {
+		c.cfg.Logger.Warn("rekey: no inbound Child SA to switch outbound to", "inSPI", inSPI)
+		return
+	}
+	c.pendingOut.Store(nil)
+	c.tun.SwapSA(e.sa)
+	c.mu.Lock()
+	c.peerTS = e.policy.peer
+	c.mu.Unlock()
+	c.fireRekey()
+	c.cfg.Logger.Info("Child SA switched", "inSPI", inSPI)
+}
+
+// RetireInbound removes the inbound Child SA under inSPI after the grace
+// period. It implements session.DataPlane.
+func (c *Client) RetireInbound(inSPI uint32) {
+	if e, ok := c.lookupInboundEntry(inSPI); ok {
+		c.scheduleInboundRemoval(inSPI, e.sa, nil)
+	}
+}
+
 // inboundSA is an inbound Child SA and the policy its packets must satisfy.
 type inboundSA struct {
 	sa     *esp.SA
@@ -423,6 +448,17 @@ func (c *Client) InstallChildSA(u session.ChildSAUpdate) {
 	sa, err := esp.NewSA(u.Suite, u.NewOutSPI, u.NewInSPI, u.OutEncr, u.OutInteg, u.InEncr, u.InInteg, c.cfg.ReplayWindow)
 	if err != nil {
 		c.cfg.Logger.Error("rekey: failed to build new Child SA", "err", err)
+		return
+	}
+	if u.InboundOnly {
+		c.inboundMu.Lock()
+		old := c.inbound.Load()
+		next := make(map[uint32]inboundSA, len(*old)+1)
+		maps.Copy(next, *old)
+		next[u.NewInSPI] = inboundSA{sa: sa, policy: c.innerPolicy(u.PeerSelectors)}
+		c.inbound.Store(&next)
+		c.inboundMu.Unlock()
+		c.cfg.Logger.Debug("installed inbound-only Child SA", "inSPI", u.NewInSPI)
 		return
 	}
 	// Copy-on-write add (rxDemux reads the registry lock-free). Serialize with
