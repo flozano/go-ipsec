@@ -158,6 +158,11 @@ func (c *Client) defaultDialSession(ctx context.Context) (*session.Session, erro
 	return sess, nil
 }
 
+// ErrAuthenticationFailed matches, through errors.Is, a Dial error caused by
+// the responder answering IKE_AUTH with AUTHENTICATION_FAILED: it refused our
+// credentials (a wrong pre-shared key or identity, or a rejected EAP login).
+var ErrAuthenticationFailed = session.ErrAuthenticationFailed
+
 // curSession returns the live IKE session for the current generation, or nil
 // before the first handshake / after Close. Hot-path readers load it lock-free.
 func (c *Client) curSession() *session.Session { return c.session.Load() }

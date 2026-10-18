@@ -743,9 +743,27 @@ func buildEAPResponse(m *eap.MSCHAPv2, req eap.Packet) (eap.Packet, error) {
 // notifyError returns an error for IKE error-class notify types.
 func notifyError(n *ikemsg.NotifyPayload) error {
 	if n.Type.IsError() {
-		return fmt.Errorf("session: responder error notify %d", n.Type)
+		return &NotifyError{Type: uint16(n.Type)}
 	}
 	return nil
+}
+
+// NotifyError is an error notify the responder answered a request with, such
+// as AUTHENTICATION_FAILED for a wrong key or identity.
+type NotifyError struct {
+	Type uint16
+}
+
+func (e *NotifyError) Error() string {
+	return fmt.Sprintf("session: responder error notify %v (%d)", ikemsg.NotifyType(e.Type), e.Type)
+}
+
+// ErrAuthenticationFailed matches, through errors.Is, a NotifyError carrying
+// AUTHENTICATION_FAILED: the responder refused our credentials.
+var ErrAuthenticationFailed = errors.New("session: the responder refused the credentials (AUTHENTICATION_FAILED)")
+
+func (e *NotifyError) Is(target error) bool {
+	return target == ErrAuthenticationFailed && ikemsg.NotifyType(e.Type) == ikemsg.NotifyAuthenticationFailed
 }
 
 // firstNotifyError returns the first error-class notify in payloads, or nil.
