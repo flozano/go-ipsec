@@ -3,6 +3,7 @@ package ipsec
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"maps"
 	"net"
 	"net/netip"
@@ -106,7 +107,7 @@ func (c *Client) startWorkers(sess *session.Session) {
 			c.cfg.Logger.Error("worker rejected by a shut-down manager", "worker", name)
 		}
 	}
-	start("rx-demux", func(ctx context.Context) { c.rxDemux(ctx, inbox) })
+	start("rx-demux", func(ctx context.Context) { c.rxDemux(ctx, inbox, onDead) })
 	start("ike-driver", func(ctx context.Context) { sess.Driver(ctx, inbox, onDead) })
 	if c.cfg.KeepAlive > 0 {
 		start("nat-keepalive", c.keepaliveLoop)
@@ -240,19 +241,53 @@ func (c *Client) tunConfig() tun2net.TunConfig {
 // that, during a rekey cutover, both the old and new Child SAs decrypt. Inbound
 // ESP is lossy — a lookup/decrypt/replay failure drops the packet and bumps a
 // counter, never blocking the reader. IKE datagrams go to the session driver.
-func (c *Client) rxDemux(ctx context.Context, inbox chan<- []byte) {
-	for {
-		// Load the session once per iteration: a reconnect stops this worker before
+// A receive error that isn't the worker's own shutdown is retried a few times
+// with a short backoff and then reported through onDead, so a dead socket ends
+// the tunnel instead of leaving it deaf until DPD gives up.
+func (c *Client) rxDemux(ctx context.Context, inbox chan<- []byte, onDead func()) {
+	c.rxLoop(ctx, func(ctx context.Context) ([]byte, error) {
+		// Load the session once per read: a reconnect stops this worker before
 		// swapping the session, but loading per-read keeps the read race-free if
 		// that ordering ever changes.
 		sess := c.curSession()
 		if sess == nil {
-			return
+			return nil, net.ErrClosed
 		}
-		raw, err := sess.RecvRaw(ctx)
+		return sess.RecvRaw(ctx)
+	}, inbox, onDead)
+}
+
+// rxRetryBase and rxMaxErrors bound how long rxLoop retries failing reads:
+// about 3 s in all before it declares the tunnel dead.
+const (
+	rxRetryBase = 50 * time.Millisecond
+	rxMaxErrors = 6
+)
+
+func (c *Client) rxLoop(ctx context.Context, recv func(context.Context) ([]byte, error), inbox chan<- []byte, onDead func()) {
+	failures := 0
+	for {
+		raw, err := recv(ctx)
 		if err != nil {
-			return // context cancelled or transport closed
+			if ctx.Err() != nil {
+				return // this generation is shutting down
+			}
+			failures++
+			if errors.Is(err, net.ErrClosed) || failures >= rxMaxErrors {
+				c.cfg.Logger.Warn("rx-demux: socket receive failing, declaring the tunnel dead",
+					"err", err, "failures", failures)
+				onDead()
+				return
+			}
+			c.cfg.Logger.Debug("rx-demux: receive failed, retrying", "err", err, "failures", failures)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(rxRetryBase << (failures - 1)):
+			}
+			continue
 		}
+		failures = 0
 		kind, payload := natt.Classify(raw)
 		switch kind {
 		case natt.KindESP:
