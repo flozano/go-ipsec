@@ -583,6 +583,21 @@ func randUint64() (uint64, error) {
 	return binary.BigEndian.Uint64(b[:]), nil
 }
 
+// randESPSPI returns a random inbound ESP SPI. Values below 256 are reserved
+// (RFC 4303 §2.1), and 0 in particular would make every inbound ESP packet look
+// like IKE to the NAT-T demultiplexer (RFC 3948 §2.2).
+func randESPSPI() ([]byte, error) {
+	for {
+		b, err := randBytes(4)
+		if err != nil {
+			return nil, err
+		}
+		if binary.BigEndian.Uint32(b) >= 256 {
+			return b, nil
+		}
+	}
+}
+
 func randBytes(n int) ([]byte, error) {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {

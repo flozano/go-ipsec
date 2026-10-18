@@ -2,6 +2,7 @@ package session
 
 import (
 	"bytes"
+	"encoding/binary"
 	"net/netip"
 	"slices"
 	"testing"
@@ -172,5 +173,17 @@ func TestRekeyedPeerSelectors(t *testing.T) {
 				t.Fatalf("got %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestRandESPSPIAvoidsReservedRange(t *testing.T) {
+	for range 10000 {
+		b, err := randESPSPI()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(b) != 4 || binary.BigEndian.Uint32(b) < 256 {
+			t.Fatalf("SPI %x is reserved", b)
+		}
 	}
 }

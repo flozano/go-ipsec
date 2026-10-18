@@ -3,7 +3,6 @@ package session
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -63,12 +62,12 @@ func (s *Session) IKEAuth(ctx context.Context) error {
 // allocChildSPI generates and records this client's first Child SA SPI, returning
 // the 4-byte value for the ESP proposal.
 func (s *Session) allocChildSPI() ([]byte, error) {
-	var spiBuf [4]byte
-	if _, err := rand.Read(spiBuf[:]); err != nil {
+	spi, err := randESPSPI()
+	if err != nil {
 		return nil, err
 	}
-	s.childInitiatorSPI = binary.BigEndian.Uint32(spiBuf[:])
-	return spiBuf[:], nil
+	s.childInitiatorSPI = binary.BigEndian.Uint32(spi)
+	return spi, nil
 }
 
 // ikeAuthPSK runs the PSK IKE_AUTH exchange: a single SK{IDi, AUTH, SA2, TSi, TSr,

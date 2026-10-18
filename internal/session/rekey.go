@@ -130,7 +130,7 @@ func (s *Session) initiateChildRekey(ctx context.Context, reestablish bool) erro
 	if s.child == nil {
 		return errors.New("session: no Child SA to rekey")
 	}
-	newSPI, err := randBytes(4)
+	newSPI, err := randESPSPI()
 	if err != nil {
 		return err
 	}
@@ -343,7 +343,7 @@ func (s *Session) handleChildRekeyRequest(ctx context.Context, hdr *ikemsg.Messa
 		}
 	}
 
-	newSPI, err := randBytes(4)
+	newSPI, err := randESPSPI()
 	if err != nil {
 		s.sendTemporaryFailure(ctx, dec, hdr.MessageID, viaOld)
 		return err
