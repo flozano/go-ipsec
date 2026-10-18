@@ -353,13 +353,20 @@ func (s *Session) handleFinalAuthResponse(payloads ikemsg.Payloads, secret []byt
 	// route full-tunnel, so a narrowed selector means traffic outside it is dropped
 	// by the gateway with no other client-side signal — surface it.
 	s.warnNarrowedTS("IKE_AUTH", tsi, tsr)
+	// We initiated, so the responder's side is TSr. With no usable address in
+	// it, every inbound packet would be refused: fail now rather than bring up
+	// a tunnel that can't carry anything.
+	peerTS := selectorPrefixes(tsr)
+	if len(peerTS) == 0 {
+		return fmt.Errorf("session: the responder's traffic selectors cover no usable address (%d selectors)", len(tsr))
+	}
+	s.authPeerSelectors = peerTS
 	s.child = &ChildSA{
-		InitiatorSPI: s.childInitiatorSPI,
-		ResponderSPI: binary.BigEndian.Uint32(prop.SPI),
-		Suite:        suite.id,
-		Keys:         s.ikeSA.DeriveChildKeys(s.nonceI, s.nonceR, suite.encrKeyLen, suite.integKeyLen),
-		// We initiated, so the responder's side is TSr.
-		PeerSelectors: selectorPrefixes(tsr),
+		InitiatorSPI:  s.childInitiatorSPI,
+		ResponderSPI:  binary.BigEndian.Uint32(prop.SPI),
+		Suite:         suite.id,
+		Keys:          s.ikeSA.DeriveChildKeys(s.nonceI, s.nonceR, suite.encrKeyLen, suite.integKeyLen),
+		PeerSelectors: peerTS,
 	}
 	if cp != nil {
 		s.assigned = parseCPReply(cp)

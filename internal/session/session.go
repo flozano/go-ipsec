@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"time"
 
 	"github.com/n0madic/go-ipsec/internal/esp"
@@ -125,12 +126,15 @@ type Session struct {
 	lastTickWall     time.Time // wall-clock of the previous housekeeping tick, for suspend/wake detection
 	fastDPDDue       bool      // a post-suspend fast DPD is armed, pending a free request window
 	childInstalledAt time.Time
-	ikeInstalledAt   time.Time
-	nextChildRekey   time.Time
-	nextIKERekey     time.Time
-	nextVolumeRekey  time.Time // earliest next volume-based Child rekey (backoff)
-	oldIKE           *ikeCtx   // superseded IKE SA kept briefly for grace decode
-	oldIKEUntil      time.Time // grace deadline for oldIKE
+	// authPeerSelectors are the peer selectors IKE_AUTH negotiated. A Child SA
+	// rekey may narrow them but never widen past them.
+	authPeerSelectors []netip.Prefix
+	ikeInstalledAt    time.Time
+	nextChildRekey    time.Time
+	nextIKERekey      time.Time
+	nextVolumeRekey   time.Time // earliest next volume-based Child rekey (backoff)
+	oldIKE            *ikeCtx   // superseded IKE SA kept briefly for grace decode
+	oldIKEUntil       time.Time // grace deadline for oldIKE
 
 	// childReestablish is set when the peer DELETEs the live Child SA but a fresh
 	// CREATE_CHILD_SA could not be started immediately — either an exchange was

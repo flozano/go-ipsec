@@ -58,7 +58,8 @@ func TestSelectorPrefixes(t *testing.T) {
 // TSi it offered, not the TSr (which is ours).
 func TestChildRekeyResponderRecordsPeerTSi(t *testing.T) {
 	initS, respS, respConn := mirrorSessions(t)
-	initS.child = &ChildSA{InitiatorSPI: 0x1111, ResponderSPI: 0x2222}
+	initS.authPeerSelectors = prefixes("192.0.2.0/24")
+	initS.child = &ChildSA{InitiatorSPI: 0x1111, ResponderSPI: 0x2222, PeerSelectors: initS.authPeerSelectors}
 	dp := &fakeDataPlane{}
 	initS.SetDataPlane(dp)
 
@@ -100,6 +101,7 @@ func TestChildRekeyInitiatorRecordsPeerTSr(t *testing.T) {
 	initS, respS, respConn := mirrorSessions(t)
 	initConn := initS.conn
 	old := prefixes("192.0.2.10/32")
+	initS.authPeerSelectors = prefixes("0.0.0.0/0")
 	initS.child = &ChildSA{InitiatorSPI: 0x1111, ResponderSPI: 0x2222, PeerSelectors: old}
 	respS.child = &ChildSA{InitiatorSPI: 0x1111, ResponderSPI: 0x2222}
 	initDP := &fakeDataPlane{}
@@ -144,5 +146,31 @@ func TestChildRekeyInitiatorRecordsPeerTSr(t *testing.T) {
 	}
 	if !slices.Equal(initS.child.PeerSelectors, want) {
 		t.Fatalf("session child PeerSelectors = %v, want %v", initS.child.PeerSelectors, want)
+	}
+}
+
+// A rekey may narrow the selectors IKE_AUTH negotiated but never widen them,
+// and an unusable set keeps the current ones rather than emptying the policy.
+func TestRekeyedPeerSelectors(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		sels []ikemsg.TrafficSelector
+		want []netip.Prefix
+	}{
+		{"narrower", []ikemsg.TrafficSelector{v4Sel("192.0.2.10", "192.0.2.10")}, prefixes("192.0.2.10/32")},
+		{"same", []ikemsg.TrafficSelector{v4Sel("192.0.2.0", "192.0.2.255")}, prefixes("192.0.2.0/24")},
+		{"wider is clamped", []ikemsg.TrafficSelector{v4Sel("0.0.0.0", "255.255.255.255")}, prefixes("192.0.2.0/24")},
+		{"disjoint keeps current", []ikemsg.TrafficSelector{v4Sel("198.51.100.1", "198.51.100.1")}, prefixes("192.0.2.128/25")},
+		{"malformed keeps current", []ikemsg.TrafficSelector{v4Sel("192.0.2.20", "192.0.2.10")}, prefixes("192.0.2.128/25")},
+		{"none keeps current", nil, prefixes("192.0.2.128/25")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _, _ := mirrorSessions(t)
+			s.authPeerSelectors = prefixes("192.0.2.0/24")
+			s.child = &ChildSA{PeerSelectors: prefixes("192.0.2.128/25")}
+			if got := s.rekeyedPeerSelectors(tc.sels); !slices.Equal(got, tc.want) {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

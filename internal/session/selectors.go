@@ -26,6 +26,41 @@ func selectorPrefixes(sels []ikemsg.TrafficSelector) []netip.Prefix {
 	return out
 }
 
+// rekeyedPeerSelectors returns the peer selectors for a rekeyed Child SA. A
+// rekey may narrow what IKE_AUTH negotiated but not widen it, so only the parts
+// of the new selectors inside the original ones are kept. If that leaves
+// nothing (no selectors, an unparseable or disjoint set), the current Child
+// SA's selectors stay: an empty set would refuse every packet.
+func (s *Session) rekeyedPeerSelectors(sels []ikemsg.TrafficSelector) []netip.Prefix {
+	cur := s.child.PeerSelectors
+	if len(sels) == 0 {
+		return cur
+	}
+	limit := s.authPeerSelectors
+	if len(limit) == 0 {
+		limit = cur
+	}
+	var out []netip.Prefix
+	for _, q := range selectorPrefixes(sels) {
+		for _, p := range limit {
+			if p.Overlaps(q) {
+				// Overlapping prefixes nest, so the overlap is the narrower one.
+				if p.Bits() > q.Bits() {
+					out = append(out, p)
+				} else {
+					out = append(out, q)
+				}
+			}
+		}
+	}
+	if len(out) == 0 {
+		s.log.Warn("rekey: the peer's traffic selectors are empty or outside the negotiated ones; keeping the current selectors",
+			"offered", len(sels))
+		return cur
+	}
+	return out
+}
+
 // rangePrefixes returns the minimal set of prefixes covering [start, end]
 // (both of the same family, start <= end).
 func rangePrefixes(start, end netip.Addr) []netip.Prefix {

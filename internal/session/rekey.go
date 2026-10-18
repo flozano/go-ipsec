@@ -235,12 +235,9 @@ func (s *Session) completeChildRekey(ctx context.Context, inner ikemsg.Payloads,
 		}
 		keys = s.ikeSA.DeriveChildKeys(p.child.ni, nr, suite.encrKeyLen, suite.integKeyLen)
 	}
-	// We initiated, so the responder's side is TSr. A response without
-	// selectors keeps the ones already negotiated.
-	peerTS := s.child.PeerSelectors
-	if _, tsr := trafficSelectors(inner); len(tsr) > 0 {
-		peerTS = selectorPrefixes(tsr)
-	}
+	// We initiated, so the responder's side is TSr.
+	_, tsr := trafficSelectors(inner)
+	peerTS := s.rekeyedPeerSelectors(tsr)
 	s.dataPlane.InstallChildSA(ChildSAUpdate{
 		NewInSPI: p.child.newInSPI, NewOutSPI: respSPI, OldInSPI: p.child.oldInSPI,
 		Suite:   suite.id,
@@ -400,11 +397,10 @@ func (s *Session) handleChildRekeyRequest(ctx context.Context, hdr *ikemsg.Messa
 	}
 	oldInSPI := s.child.InitiatorSPI
 	// The peer initiated this exchange, so its side is the TSi it offered, which
-	// the response echoes. A request without selectors keeps the ones already
-	// negotiated.
+	// the response echoes.
 	peerTS := s.child.PeerSelectors
-	if len(reqTSi) > 0 && len(reqTSr) > 0 {
-		peerTS = selectorPrefixes(reqTSi)
+	if len(reqTSr) > 0 {
+		peerTS = s.rekeyedPeerSelectors(reqTSi)
 	}
 	s.dataPlane.InstallChildSA(ChildSAUpdate{
 		NewInSPI: binary.BigEndian.Uint32(newSPI), NewOutSPI: serverNewSPI, OldInSPI: oldInSPI,
