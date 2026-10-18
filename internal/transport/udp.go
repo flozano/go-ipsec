@@ -30,7 +30,16 @@ type udpConn struct {
 	prevUntil atomic.Int64
 	rbuf      []byte
 	closed    atomic.Bool
+	// hostSocket is set for the default host UDP socket, whose writes don't
+	// block, so Send leaves the write deadline alone (see Send).
+	hostSocket bool
 }
+
+// hostSocketBuffer is the receive and send buffer requested for the host UDP
+// socket. Every packet of the tunnel crosses this one socket, and the default
+// (about 64 KB on Windows, some 45 full-size packets) overflows on a single
+// TCP window's burst. The OS may grant less.
+const hostSocketBuffer = 4 << 20
 
 // migrationGrace is how long datagrams from the pre-migration server port are
 // still accepted after MigrateToPort.
@@ -60,12 +69,18 @@ func DialUDP(ctx context.Context, dial DialFunc, network, serverAddr string) (Co
 	if dial != nil {
 		pc, err = dial(ctx, network, serverAddr)
 	} else {
-		pc, err = net.ListenUDP(network, nil)
+		var uc *net.UDPConn
+		uc, err = net.ListenUDP(network, nil)
+		if err == nil {
+			_ = uc.SetReadBuffer(hostSocketBuffer)
+			_ = uc.SetWriteBuffer(hostSocketBuffer)
+			pc = uc
+		}
 	}
 	if err != nil {
 		return nil, fmt.Errorf("transport: dial %q: %w", serverAddr, err)
 	}
-	u := &udpConn{pc: pc, rbuf: make([]byte, maxDatagram)}
+	u := &udpConn{pc: pc, rbuf: make([]byte, maxDatagram), hostSocket: dial == nil}
 	u.remote.Store(remote)
 	return u, nil
 }
@@ -74,7 +89,22 @@ func (u *udpConn) Send(ctx context.Context, p []byte) error {
 	if u.closed.Load() {
 		return ErrClosed
 	}
-	// Mirror Recv's discipline: the top-of-Send deadline set is authoritative
+	if u.hostSocket {
+		// A host UDP write doesn't block: it queues the datagram or fails at
+		// once. The deadline is per socket and shared by every sender (the
+		// data plane, the driver, keepalives), so one sender's cancellation
+		// would otherwise fail another's write, such as a graceful DELETE at
+		// shutdown, and every packet would pay two extra syscalls.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		_, err := u.pc.WriteTo(p, u.remote.Load())
+		if err != nil && u.closed.Load() {
+			return ErrClosed
+		}
+		return err
+	}
+	// A custom PacketConn may block under backpressure. Mirror Recv's discipline: the top-of-Send deadline set is authoritative
 	// (it also neutralises a leftover aLongTimeAgo from a prior Send's
 	// cancellation AfterFunc), and the AfterFunc interrupts a blocked write on
 	// plain cancellation. Without it a no-deadline driver send over a blocking
