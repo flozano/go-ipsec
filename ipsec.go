@@ -60,8 +60,9 @@ type Client struct {
 	// still decrypt. rxDemux reads it lock-free via the atomic pointer; the
 	// copy-on-write writers (InstallChildSA on the driver goroutine, the
 	// grace-removal timer, and the reconnect reset) serialize under inboundMu so a
-	// concurrent read-modify-write can't lose an update.
-	inbound   atomic.Pointer[map[uint32]*esp.SA]
+	// concurrent read-modify-write can't lose an update. Each entry carries the
+	// policy its decrypted packets must satisfy (see innerPolicy).
+	inbound   atomic.Pointer[map[uint32]inboundSA]
 	inboundMu sync.Mutex
 
 	// lastDataInbound is the UnixNano time of the most recent decrypted inbound
@@ -207,7 +208,8 @@ func (c *Client) netstack() (*tun2net.Net, error) {
 }
 
 // RxDrops returns the number of inbound ESP packets dropped by decrypt/replay
-// failures.
+// failures, or because the decrypted packet fell outside the Child SA's traffic
+// selectors or wasn't addressed to us.
 func (c *Client) RxDrops() uint64 { return c.rxDrops.Load() }
 
 // LocalIP returns the address assigned by the responder's configuration

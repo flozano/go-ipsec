@@ -128,9 +128,79 @@ func (c *Client) sendESP(ctx context.Context, pkt []byte) error {
 // serialized under inboundMu with the grace-removal timer so a stale removal from
 // a prior generation cannot lose the new entry.
 func (c *Client) resetInbound(spi uint32, sa *esp.SA) {
+	c.mu.Lock()
+	peer := c.peerTS
+	c.mu.Unlock()
+	e := inboundSA{sa: sa, policy: c.innerPolicy(peer)}
 	c.inboundMu.Lock()
-	c.inbound.Store(&map[uint32]*esp.SA{spi: sa})
+	c.inbound.Store(&map[uint32]inboundSA{spi: e})
 	c.inboundMu.Unlock()
+}
+
+// inboundSA is an inbound Child SA and the policy its packets must satisfy.
+type inboundSA struct {
+	sa     *esp.SA
+	policy innerPolicy
+}
+
+// innerPolicy is what a decrypted inbound packet must satisfy before it is
+// delivered (RFC 4301 §5.2): a well-formed IP header, a source inside the
+// Child SA's peer traffic selectors, and a destination that is our assigned
+// address. ESP authenticates the peer, not what it puts inside the tunnel.
+type innerPolicy struct {
+	peer   []netip.Prefix
+	local  netip.Addr   // assigned IPv4 address; zero when none was assigned
+	local6 netip.Prefix // assigned IPv6 prefix; zero means no inner IPv6
+}
+
+// innerPolicy builds the policy for a Child SA with the given peer selectors,
+// against the current session's assigned addresses.
+func (c *Client) innerPolicy(peer []netip.Prefix) innerPolicy {
+	p := innerPolicy{peer: peer}
+	if s := c.curSession(); s != nil {
+		a := s.Assigned()
+		p.local, p.local6 = a.IP, a.IP6
+	}
+	return p
+}
+
+// allows reports whether a decrypted packet may be delivered.
+func (p innerPolicy) allows(pkt []byte) bool {
+	if len(pkt) == 0 {
+		return false
+	}
+	var src netip.Addr
+	switch pkt[0] >> 4 {
+	case 4:
+		if len(pkt) < 20 {
+			return false
+		}
+		ihl := int(pkt[0]&0x0f) * 4
+		total := int(binary.BigEndian.Uint16(pkt[2:4]))
+		if ihl < 20 || total < ihl || total > len(pkt) {
+			return false
+		}
+		src = netip.AddrFrom4([4]byte(pkt[12:16]))
+		if p.local.IsValid() && netip.AddrFrom4([4]byte(pkt[16:20])) != p.local {
+			return false
+		}
+	case 6:
+		if len(pkt) < 40 || 40+int(binary.BigEndian.Uint16(pkt[4:6])) > len(pkt) {
+			return false
+		}
+		src = netip.AddrFrom16([16]byte(pkt[8:24]))
+		if !p.local6.IsValid() || !p.local6.Contains(netip.AddrFrom16([16]byte(pkt[24:40]))) {
+			return false
+		}
+	default:
+		return false
+	}
+	for _, pr := range p.peer {
+		if pr.Contains(src) {
+			return true
+		}
+	}
+	return false
 }
 
 // stopGraceTimers stops and forgets every pending grace-removal timer. Called on
@@ -191,17 +261,23 @@ func (c *Client) rxDemux(ctx context.Context, inbox chan<- []byte) {
 				continue
 			}
 			spi := binary.BigEndian.Uint32(payload[:4])
-			sa := c.lookupInbound(spi)
-			if sa == nil {
+			e, ok := c.lookupInboundEntry(spi)
+			if !ok {
 				c.rxDrops.Add(1)
 				continue
 			}
-			inner, err := sa.Decrypt(payload)
+			inner, err := e.sa.Decrypt(payload)
 			if err != nil {
 				c.rxDrops.Add(1)
 				continue
 			}
+			// Authenticated, so it proves the peer is alive even if the packet
+			// itself is then refused.
 			c.lastDataInbound.Store(time.Now().UnixNano())
+			if !e.policy.allows(inner) {
+				c.rxDrops.Add(1)
+				continue
+			}
 			c.tun.DeliverInbound(inner)
 		case natt.KindIKE:
 			// Hand to this generation's session driver (DPD / DELETE / rekey).
@@ -231,11 +307,19 @@ func (c *Client) LastDataInbound() time.Time {
 
 // lookupInbound returns the inbound Child SA registered for an SPI, or nil.
 func (c *Client) lookupInbound(spi uint32) *esp.SA {
+	e, _ := c.lookupInboundEntry(spi)
+	return e.sa
+}
+
+// lookupInboundEntry returns the inbound Child SA registered for an SPI and its
+// packet policy.
+func (c *Client) lookupInboundEntry(spi uint32) (inboundSA, bool) {
 	m := c.inbound.Load()
 	if m == nil {
-		return nil
+		return inboundSA{}, false
 	}
-	return (*m)[spi]
+	e, ok := (*m)[spi]
+	return e, ok
 }
 
 // ChildSAVolume reports the outbound ESP sequence number of the live Child SA so
@@ -253,10 +337,10 @@ func (c *Client) removeInbound(spi uint32, want *esp.SA) {
 	c.inboundMu.Lock()
 	defer c.inboundMu.Unlock()
 	old := c.inbound.Load()
-	if cur, ok := (*old)[spi]; !ok || cur != want {
+	if cur, ok := (*old)[spi]; !ok || cur.sa != want {
 		return
 	}
-	next := make(map[uint32]*esp.SA, len(*old))
+	next := make(map[uint32]inboundSA, len(*old))
 	for k, v := range *old {
 		if k != spi {
 			next[k] = v
@@ -282,10 +366,10 @@ func (c *Client) InstallChildSA(u session.ChildSAUpdate) {
 	// the add here or a removal.
 	c.inboundMu.Lock()
 	old := c.inbound.Load()
-	superseded := (*old)[u.OldInSPI] // captured for an identity-guarded grace removal
-	next := make(map[uint32]*esp.SA, len(*old)+1)
+	superseded := (*old)[u.OldInSPI].sa // captured for an identity-guarded grace removal
+	next := make(map[uint32]inboundSA, len(*old)+1)
 	maps.Copy(next, *old)
-	next[u.NewInSPI] = sa
+	next[u.NewInSPI] = inboundSA{sa: sa, policy: c.innerPolicy(u.PeerSelectors)}
 	c.inbound.Store(&next)
 	c.inboundMu.Unlock()
 

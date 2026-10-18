@@ -102,12 +102,12 @@ func (c *Client) reconnect() {
 		c.signalDeath()
 		return
 	}
-	c.resetInbound(child.InitiatorSPI, sa)
 	c.session.Store(sess)
 	c.mu.Lock()
 	c.localIP = sess.Assigned().IP
 	c.peerTS = child.PeerSelectors
 	c.mu.Unlock()
+	c.resetInbound(child.InitiatorSPI, sa) // after peerTS: the entry captures the policy
 
 	// (6) Re-address the netstack in place (force-closing stale connections) and
 	// fire the reconnect hooks. Always Reconfigure, never SwapSA: the server
