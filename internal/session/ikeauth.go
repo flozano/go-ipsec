@@ -398,27 +398,55 @@ func (s *Session) exchangeSK(ctx context.Context, exchangeType ikemsg.ExchangeTy
 	if err != nil {
 		return nil, err
 	}
-	rawResp, err := s.exchange(ctx, reqBytes, msgID)
-	if err != nil {
-		return nil, err
+	// Verify each candidate inside the receive loop: a datagram that fails the
+	// ICV is unauthenticated (a spoof, or a stale message under other keys), so
+	// it is dropped and the wait goes on rather than failing the exchange.
+	var payloads ikemsg.Payloads
+	check := func(raw []byte, _ *ikemsg.Message) error {
+		_, inner, icvOK, err := decodeSKWith(s.ikeSA, raw)
+		if err != nil {
+			if icvOK {
+				return fatalResponse{err}
+			}
+			return err
+		}
+		payloads = inner
+		return nil
 	}
-	_, payloads, err := s.decodeSK(rawResp)
-	if err != nil {
+	if _, err := s.exchange(ctx, reqBytes, exchangeType, msgID, check); err != nil {
 		return nil, err
 	}
 	return payloads, nil
 }
 
-// exchange sends a request and waits for the response with the expected message
-// ID, retransmitting with exponential backoff on timeout.
-func (s *Session) exchange(ctx context.Context, reqBytes []byte, expectMsgID uint32) ([]byte, error) {
+// responseCheck vets a datagram that already matches the pending request's
+// Message ID, exchange type and SPIs. nil takes it as the response. Any other
+// error drops it and keeps waiting, except two kinds:
+//   - unauthenticatedError: an unprotected error notify. RFC 7296 §2.21.1: it
+//     may be forged, so keep waiting for a valid response, and report it only
+//     if none arrives before this attempt's retransmit timer;
+//   - fatalResponse: an authenticated but unusable response; fail now.
+type responseCheck func(raw []byte, m *ikemsg.Message) error
+
+type unauthenticatedError struct{ error }
+
+func (e unauthenticatedError) Unwrap() error { return e.error }
+
+type fatalResponse struct{ error }
+
+func (e fatalResponse) Unwrap() error { return e.error }
+
+// exchange sends a request and waits for its response, retransmitting with
+// exponential backoff on timeout. check (optional) vets each candidate; see
+// responseCheck.
+func (s *Session) exchange(ctx context.Context, reqBytes []byte, exchangeType ikemsg.ExchangeType, expectMsgID uint32, check responseCheck) ([]byte, error) {
 	backoff := s.retransmitBase()
 	for attempt := 0; attempt < s.retransmitTries(); attempt++ {
 		if err := s.sendDatagram(ctx, reqBytes); err != nil {
 			return nil, err
 		}
 		deadlineCtx, cancel := context.WithTimeout(ctx, backoff)
-		raw, err := s.recvMatching(deadlineCtx, expectMsgID)
+		raw, noted, err := s.recvMatching(deadlineCtx, exchangeType, expectMsgID, check)
 		cancel()
 		if err == nil {
 			return raw, nil
@@ -426,20 +454,33 @@ func (s *Session) exchange(ctx context.Context, reqBytes []byte, expectMsgID uin
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
+		var fatal fatalResponse
+		if errors.As(err, &fatal) {
+			return nil, fatal.error
+		}
+		if noted != nil {
+			// Only an unauthenticated error notify came back for a whole
+			// retransmit interval: report it rather than retry into it.
+			return nil, noted
+		}
 		backoff = minDuration(backoff*2, s.retransmitMax())
 	}
 	return nil, fmt.Errorf("session: no response after %d retransmits", s.retransmitTries())
 }
 
-// recvMatching receives datagrams until one decodes with the expected message
-// ID (dropping stale retransmits) or the context fires.
-func (s *Session) recvMatching(ctx context.Context, expectMsgID uint32) ([]byte, error) {
+// recvMatching receives datagrams until one is the response to our pending
+// request and passes check, or the context fires. A response must carry the
+// expected Message ID, the Response flag, the request's exchange type, our
+// initiator SPI and, once known, the responder's SPI; anything else (stale
+// retransmits, other SAs, spoofs) is dropped. noted is the last unauthenticated
+// error notify seen, for the caller to report on timeout.
+func (s *Session) recvMatching(ctx context.Context, exchangeType ikemsg.ExchangeType, expectMsgID uint32, check responseCheck) (raw []byte, noted error, err error) {
 	for {
-		raw, err := s.recvDatagram(ctx)
+		dg, err := s.recvDatagram(ctx)
 		if err != nil {
-			return nil, err
+			return nil, noted, err
 		}
-		hdr, err := ikemsg.Parse(raw)
+		hdr, err := ikemsg.Parse(dg)
 		if err != nil {
 			s.log.Debug("dropping undecodable datagram", "err", err)
 			continue
@@ -455,7 +496,29 @@ func (s *Session) recvMatching(ctx context.Context, expectMsgID uint32) ([]byte,
 			s.log.Debug("dropping request with matching message ID", "id", hdr.MessageID)
 			continue
 		}
-		return append([]byte(nil), raw...), nil
+		if hdr.Exchange != exchangeType || hdr.InitiatorSPI != s.initiatorSPI ||
+			(s.responderSPI != 0 && hdr.ResponderSPI != s.responderSPI) {
+			s.log.Debug("dropping response for another exchange or SA",
+				"exchange", hdr.Exchange, "spii", fmt.Sprintf("%016x", hdr.InitiatorSPI),
+				"spir", fmt.Sprintf("%016x", hdr.ResponderSPI))
+			continue
+		}
+		dg = append([]byte(nil), dg...)
+		if check != nil {
+			if err := check(dg, hdr); err != nil {
+				var fatal fatalResponse
+				if errors.As(err, &fatal) {
+					return nil, noted, err
+				}
+				var unauth unauthenticatedError
+				if errors.As(err, &unauth) {
+					noted = unauth.error
+				}
+				s.log.Debug("dropping response", "err", err)
+				continue
+			}
+		}
+		return dg, noted, nil
 	}
 }
 

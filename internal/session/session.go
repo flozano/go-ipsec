@@ -6,6 +6,7 @@
 package session
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/x509"
@@ -216,6 +217,7 @@ func (s *Session) IKESAInit(ctx context.Context) error {
 	if s.initiatorSPI, err = randUint64(); err != nil {
 		return err
 	}
+	s.responderSPI = 0 // unknown until the response; recvMatching keys on it
 	// Prefer x25519 (group 31); fall back to MODP-2048 if the responder demands it
 	// via INVALID_KE_PAYLOAD below.
 	if s.dh, err = ikesa.NewDH(ikemsg.DH_X25519); err != nil {
@@ -289,12 +291,51 @@ func (s *Session) sendSAInit(ctx context.Context, cookie []byte) ([]byte, error)
 	s.initSAInitReq = reqBytes
 	// exchange() returns a fresh copy (transport.Recv only lends its buffer until
 	// the next Recv), so the stored response stays valid for the AUTH octets.
-	rspBytes, err := s.exchange(ctx, reqBytes, 0)
+	rspBytes, err := s.exchange(ctx, reqBytes, ikemsg.ExchangeIKESAInit, 0, s.saInitCheck(cookie))
 	if err != nil {
 		return nil, fmt.Errorf("session: IKE_SA_INIT exchange: %w", err)
 	}
 	s.initSAInitRsp = rspBytes
 	return s.initSAInitRsp, nil
+}
+
+// saInitCheck vets a candidate IKE_SA_INIT response. Nothing in it is
+// authenticated yet, so anything that can't be the answer to the request just
+// sent is dropped, and an error notify is only noted (RFC 7296 §2.21.1):
+//   - a COOKIE equal to the one this request echoes is a late duplicate of the
+//     previous response;
+//   - an INVALID_KE_PAYLOAD naming the group we now use is a late duplicate,
+//     and one naming a group we don't support is noted, not acted on;
+//   - a response without either must carry the responder's SPI.
+func (s *Session) saInitCheck(cookieSent []byte) responseCheck {
+	return func(raw []byte, m *ikemsg.Message) error {
+		if c, ok := saInitCookie(raw); ok {
+			if cookieSent != nil && bytes.Equal(c, cookieSent) {
+				return errors.New("session: stale IKE_SA_INIT COOKIE")
+			}
+			return nil
+		}
+		if g, ok := saInitInvalidKE(raw); ok {
+			if g == s.dh.Group {
+				return errors.New("session: stale INVALID_KE_PAYLOAD for our current DH group")
+			}
+			if !supportedDHGroup(g) {
+				return unauthenticatedError{fmt.Errorf("session: responder requires DH group %d (INVALID_KE_PAYLOAD); no mutually-supported DH group", g)}
+			}
+			return nil
+		}
+		for _, p := range m.Payloads {
+			if n, ok := p.(*ikemsg.NotifyPayload); ok {
+				if err := saInitNotifyError(n); err != nil {
+					return unauthenticatedError{err}
+				}
+			}
+		}
+		if m.ResponderSPI == 0 {
+			return errors.New("session: IKE_SA_INIT response with a zero responder SPI")
+		}
+		return nil
+	}
 }
 
 // saInitCookie returns the COOKIE notify data from an IKE_SA_INIT response, if
