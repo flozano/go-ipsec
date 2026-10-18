@@ -372,6 +372,7 @@ func (s *Session) housekeeping(ctx context.Context, onDead func()) (exit bool) {
 		s.oldIKE = nil
 		s.oldPeer = peerDedup{}
 		s.oldIKEDelete = nil // grace expired; stop retransmitting the old-SA DELETE
+		s.publishIKESPIs()
 	}
 
 	// Retransmit the superseded-IKE-SA DELETE under the old SA during the grace

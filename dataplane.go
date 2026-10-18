@@ -339,9 +339,14 @@ func (c *Client) rxLoop(ctx context.Context, recv func(context.Context) ([]byte,
 			}
 			c.tun.DeliverInbound(inner)
 		case natt.KindIKE:
-			// Hand to this generation's session driver (DPD / DELETE / rekey).
+			// Hand to this generation's session driver (DPD / DELETE / rekey),
+			// unless it can't concern this IKE SA: other SPIs (a spoof, a stale
+			// SA) would only compete with real messages for the inbox.
 			// Non-blocking: if the driver is busy, drop — IKE control is
 			// retransmitted.
+			if sess := c.curSession(); sess == nil || !sess.ForThisIKESA(payload) {
+				continue
+			}
 			select {
 			case inbox <- append([]byte(nil), payload...):
 			default:

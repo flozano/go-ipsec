@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/netip"
+	"sync/atomic"
 	"time"
 
 	"github.com/n0madic/go-ipsec/internal/esp"
@@ -134,7 +135,11 @@ type Session struct {
 	nextIKERekey      time.Time
 	nextVolumeRekey   time.Time // earliest next volume-based Child rekey (backoff)
 	oldIKE            *ikeCtx   // superseded IKE SA kept briefly for grace decode
-	oldIKEUntil       time.Time // grace deadline for oldIKE
+	// ikeSPIs snapshots the SPI pairs of the current and superseded IKE SAs so
+	// the data plane can pre-filter IKE datagrams (ForThisIKESA) without
+	// reading driver-owned state. Republished whenever either SA changes.
+	ikeSPIs     atomic.Pointer[[]ikeSPIPair]
+	oldIKEUntil time.Time // grace deadline for oldIKE
 
 	// childReestablish is set when the peer DELETEs the live Child SA but a fresh
 	// CREATE_CHILD_SA could not be started immediately — either an exchange was
@@ -421,6 +426,7 @@ func (s *Session) handleSAInitResponse(raw []byte) error {
 		return errors.New("session: responder SPI is zero")
 	}
 	s.responderSPI = m.ResponderSPI
+	s.publishIKESPIs()
 
 	var (
 		gotSA, gotKE, gotNonce bool
@@ -581,6 +587,39 @@ func randUint64() (uint64, error) {
 		return 0, err
 	}
 	return binary.BigEndian.Uint64(b[:]), nil
+}
+
+type ikeSPIPair struct{ spii, spir uint64 }
+
+// publishIKESPIs refreshes the ikeSPIs snapshot. Driver goroutine only.
+func (s *Session) publishIKESPIs() {
+	pairs := []ikeSPIPair{{s.initiatorSPI, s.responderSPI}}
+	if s.oldIKE != nil {
+		pairs = append(pairs, ikeSPIPair{s.oldIKE.spii, s.oldIKE.spir})
+	}
+	s.ikeSPIs.Store(&pairs)
+}
+
+// ForThisIKESA reports whether an IKE datagram (NAT-T marker removed) is an
+// IKEv2 message carrying the SPIs of this session's current or superseded IKE
+// SA. It is a cheap, unauthenticated pre-filter that lets the data plane drop
+// datagrams that can't concern us before they compete for the driver's inbox.
+// Safe from any goroutine.
+func (s *Session) ForThisIKESA(dg []byte) bool {
+	if len(dg) < 28 || dg[17]>>4 != 2 {
+		return false
+	}
+	spii, spir := binary.BigEndian.Uint64(dg[0:8]), binary.BigEndian.Uint64(dg[8:16])
+	pairs := s.ikeSPIs.Load()
+	if pairs == nil {
+		return false
+	}
+	for _, p := range *pairs {
+		if p.spii == spii && p.spir == spir {
+			return true
+		}
+	}
+	return false
 }
 
 // randESPSPI returns a random inbound ESP SPI. Values below 256 are reserved

@@ -760,6 +760,7 @@ func (s *Session) swapIKE(newIKE *ikesa.IKESA, spii, spir uint64) {
 	s.ikeSA = newIKE
 	s.initiatorSPI = spii
 	s.responderSPI = spir
+	s.publishIKESPIs()
 	s.messageID = 0
 	s.ikeInstalledAt = time.Now()
 	// The cutover resets the IKE SA soft lifetime; push the next-IKE-rekey

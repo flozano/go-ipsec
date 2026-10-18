@@ -121,3 +121,43 @@ func TestUnauthenticatedSAInitErrorReportedOnTimeout(t *testing.T) {
 	}
 	t.Logf("reported: %v", err)
 }
+
+func TestForThisIKESA(t *testing.T) {
+	s, _, _ := spoofPair(t)
+	dg := func(spii, spir uint64) []byte {
+		m := &ikemsg.Message{InitiatorSPI: spii, ResponderSPI: spir, Exchange: ikemsg.ExchangeInformational}
+		raw, _ := m.Marshal()
+		return raw
+	}
+	if s.ForThisIKESA(dg(1, 2)) {
+		t.Fatal("accepted before any SA exists")
+	}
+	s.initiatorSPI, s.responderSPI = 1, 2
+	s.publishIKESPIs()
+	if !s.ForThisIKESA(dg(1, 2)) {
+		t.Fatal("current SA refused")
+	}
+	for _, bad := range [][]byte{dg(1, 3), dg(3, 2), dg(2, 1), dg(1, 2)[:27]} {
+		if s.ForThisIKESA(bad) {
+			t.Fatalf("accepted %x", bad)
+		}
+	}
+	v1 := dg(1, 2)
+	v1[17] = 0x10
+	if s.ForThisIKESA(v1) {
+		t.Fatal("accepted IKEv1")
+	}
+
+	// After an IKE rekey both SAs pass until the old one's grace ends.
+	s.oldIKE = &ikeCtx{spii: 1, spir: 2}
+	s.initiatorSPI, s.responderSPI = 5, 6
+	s.publishIKESPIs()
+	if !s.ForThisIKESA(dg(1, 2)) || !s.ForThisIKESA(dg(5, 6)) {
+		t.Fatal("old or new SA refused during the grace period")
+	}
+	s.oldIKE = nil
+	s.publishIKESPIs()
+	if s.ForThisIKESA(dg(1, 2)) {
+		t.Fatal("old SA still accepted after its grace period")
+	}
+}
