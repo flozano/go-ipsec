@@ -331,6 +331,9 @@ func (sa *SA) decryptCBC(pkt []byte) ([]byte, error) {
 		return nil, fmt.Errorf("esp: unknown SPI %08x", spi)
 	}
 	seq := binary.BigEndian.Uint32(pkt[4:8])
+	if sa.replay.Seen(seq) {
+		return nil, ErrReplay // before the HMAC, the expensive part
+	}
 
 	// Verify ICV before doing anything else with the contents.
 	icvStart := len(pkt) - espICVLen
@@ -362,6 +365,9 @@ func (sa *SA) decryptAEAD(pkt []byte) ([]byte, error) {
 		return nil, fmt.Errorf("esp: unknown SPI %08x", spi)
 	}
 	seq := binary.BigEndian.Uint32(pkt[4:8])
+	if sa.replay.Seen(seq) {
+		return nil, ErrReplay // before the AEAD open, which is the expensive part
+	}
 
 	// Open authenticates the associated data (SPI | Seq), the ciphertext and
 	// the tag in one pass; nothing about the packet is trusted before it

@@ -533,10 +533,15 @@ func TestKATAESGCM256McGrew(t *testing.T) {
 		t.Fatalf("expected the Next Header filter to reject NH=1 after authentication, got %v", err)
 	}
 	// A flipped tag byte must fail AUTHENTICATION, proving the check above
-	// really did verify the tag before reaching the trailer.
+	// really did verify the tag before reaching the trailer. A fresh SA, since
+	// the original's replay window has already seen this sequence number.
+	fresh, err := NewSA(SuiteAESGCM256, 0xdeadbeef, 0x4a2cbfe3, keymat, nil, keymat, nil, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
 	bad := append([]byte(nil), packet...)
 	bad[len(bad)-1] ^= 0xFF
-	if _, err := sa.Decrypt(bad); err == nil || !strings.Contains(err.Error(), "authentication failed") {
+	if _, err := fresh.Decrypt(bad); err == nil || !strings.Contains(err.Error(), "authentication failed") {
 		t.Fatalf("expected AEAD authentication failure on a flipped tag, got %v", err)
 	}
 	// White-box: the raw AEAD under our salt/nonce/AAD conventions reproduces
@@ -627,6 +632,59 @@ func TestReplayWindowHugeSizeNoOverflow(t *testing.T) {
 		}
 		if !w.Accept(1) {
 			t.Fatalf("size %d: first packet rejected", size)
+		}
+	}
+}
+
+// Seen mirrors Accept's verdict without recording anything.
+func TestReplayWindowSeen(t *testing.T) {
+	w := NewReplayWindow(64)
+	if !w.Seen(0) {
+		t.Fatal("sequence 0 not refused")
+	}
+	if w.Seen(5) {
+		t.Fatal("unseen sequence refused")
+	}
+	if w.Seen(5) || !w.Accept(5) {
+		t.Fatal("Seen recorded the sequence")
+	}
+	if !w.Seen(5) {
+		t.Fatal("replay not refused")
+	}
+	w.Accept(200)
+	if !w.Seen(100) || w.Seen(199) || w.Seen(201) {
+		t.Fatal("window bounds wrong")
+	}
+}
+
+// A replayed packet is refused with ErrReplay before authentication: a copy
+// with a broken tag still reports ErrReplay, not an authentication failure.
+func TestDecryptRefusesReplayBeforeAuthentication(t *testing.T) {
+	for _, suite := range []Suite{SuiteAESGCM256, SuiteAESCBC256SHA256} {
+		key := bytes.Repeat([]byte{0x11}, 36)
+		integ := []byte(nil)
+		if suite == SuiteAESCBC256SHA256 {
+			key, integ = bytes.Repeat([]byte{0x11}, 32), bytes.Repeat([]byte{0x22}, 32)
+		}
+		tx, err := NewSA(suite, 7, 8, key, integ, key, integ, 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rx, err := NewSA(suite, 8, 7, key, integ, key, integ, 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pkt, err := tx.Encrypt(append([]byte{0x45}, make([]byte, 19)...))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := rx.Decrypt(pkt); err != nil {
+			t.Fatal(err)
+		}
+		forged := append([]byte(nil), pkt...)
+		forged[len(forged)-1] ^= 0xff
+		if _, err := rx.Decrypt(forged); !errors.Is(err, ErrReplay) {
+			t.Fatalf("suite %v: replayed packet with a broken tag: err = %v, want ErrReplay", suite, err)
 		}
 	}
 }

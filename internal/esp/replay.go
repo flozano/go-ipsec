@@ -68,6 +68,23 @@ func (w *ReplayWindow) Accept(seq uint32) bool {
 	}
 }
 
+// Seen reports, without recording anything, whether Accept would refuse seq.
+// RFC 4303 §3.4.3 has the receiver check this before verifying the ICV, so a
+// replayed or stale packet is dropped without paying for authentication. Only
+// Accept, after the ICV, moves the window.
+func (w *ReplayWindow) Seen(seq uint32) bool {
+	if seq == 0 {
+		return true
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if seq > w.last {
+		return false
+	}
+	offset := w.last - seq
+	return offset >= w.size || w.getBit(offset)
+}
+
 func (w *ReplayWindow) setBit(offset uint32) {
 	w.bits[offset/64] |= 1 << (offset % 64)
 }
