@@ -190,3 +190,61 @@ func TestSendAfterClose(t *testing.T) {
 		t.Fatalf("Send after Close = %v, want ErrClosed", err)
 	}
 }
+
+// Datagrams from the server's host but another port are dropped; after a
+// migration the previous port is still accepted for the grace period.
+func TestRecvAcceptsOnlyTheServerPort(t *testing.T) {
+	listen := func() *net.UDPConn {
+		c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { c.Close() })
+		return c
+	}
+	server, other := listen(), listen()
+	conn, err := DialUDP(context.Background(), nil, "udp", server.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	// Learn the client's port by sending to the server first.
+	if err := conn.Send(context.Background(), []byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 64)
+	_, client, err := server.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recv := func() string {
+		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+		defer cancel()
+		b, err := conn.Recv(ctx)
+		if err != nil {
+			return ""
+		}
+		return string(b)
+	}
+
+	other.WriteToUDP([]byte("spoof"), client)
+	server.WriteToUDP([]byte("real"), client)
+	if got := recv(); got != "real" {
+		t.Fatalf("got %q, want the server's datagram only", got)
+	}
+
+	conn.(*udpConn).MigrateToPort(other.LocalAddr().(*net.UDPAddr).Port)
+	other.WriteToUDP([]byte("new port"), client)
+	if got := recv(); got != "new port" {
+		t.Fatalf("got %q from the migrated-to port", got)
+	}
+	server.WriteToUDP([]byte("old port"), client)
+	if got := recv(); got != "old port" {
+		t.Fatalf("got %q from the previous port during the grace period", got)
+	}
+	conn.(*udpConn).prevUntil.Store(time.Now().Add(-time.Second).UnixNano())
+	server.WriteToUDP([]byte("too late"), client)
+	if got := recv(); got != "" {
+		t.Fatalf("got %q from the previous port after the grace period", got)
+	}
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strconv"
 	"sync/atomic"
 	"time"
 )
@@ -22,14 +23,28 @@ const maxDatagram = 65535
 type udpConn struct {
 	pc     net.PacketConn
 	remote atomic.Pointer[net.UDPAddr]
-	rbuf   []byte
-	closed atomic.Bool
+	// prevPort is the server port before the last MigrateToPort, accepted as a
+	// source until prevUntil (UnixNano) so replies already in flight from it
+	// still arrive.
+	prevPort  atomic.Int32
+	prevUntil atomic.Int64
+	rbuf      []byte
+	closed    atomic.Bool
 }
+
+// migrationGrace is how long datagrams from the pre-migration server port are
+// still accepted after MigrateToPort.
+const migrationGrace = 30 * time.Second
 
 // MigrateToPort switches the remote endpoint to the same host on a new port.
 // Used to move IKE/ESP onto the NAT-T port 4500 after NAT detection.
 func (u *udpConn) MigrateToPort(port int) {
 	old := u.remote.Load()
+	if old.Port == port {
+		return
+	}
+	u.prevPort.Store(int32(old.Port))
+	u.prevUntil.Store(time.Now().Add(migrationGrace).UnixNano())
 	next := &net.UDPAddr{IP: old.IP, Port: port, Zone: old.Zone}
 	u.remote.Store(next)
 }
@@ -118,9 +133,9 @@ func (u *udpConn) Recv(ctx context.Context) ([]byte, error) {
 			return nil, err
 		}
 		// Single-peer channel: ignore stray datagrams from other sources. The
-		// host must match; the port may be the pre- or post-migration value so
-		// in-flight replies from :500 are still accepted right after migration.
-		if !sameHost(src, u.remote.Load()) {
+		// host and port must match the server's; right after a migration the
+		// previous port is accepted too, for replies already in flight.
+		if !u.fromServer(src) {
 			continue
 		}
 		return u.rbuf[:n], nil
@@ -137,16 +152,37 @@ func (u *udpConn) Close() error {
 	return u.pc.Close()
 }
 
-// sameHost reports whether two addresses share the same host. The port is
-// intentionally ignored so a server that migrates its source port between 500
-// and 4500 during NAT-T is still recognised as the bound peer.
-func sameHost(a, b net.Addr) bool {
-	ua, ok1 := a.(*net.UDPAddr)
-	ub, ok2 := b.(*net.UDPAddr)
-	if ok1 && ok2 {
-		return ua.IP.Equal(ub.IP)
+// fromServer reports whether src is the server: its host and current port,
+// or its pre-migration port during the grace period.
+func (u *udpConn) fromServer(src net.Addr) bool {
+	remote := u.remote.Load()
+	host, port, ok := hostPort(src)
+	if !ok || !host.Equal(remote.IP) {
+		return false
 	}
-	ah, _, _ := net.SplitHostPort(a.String())
-	bh, _, _ := net.SplitHostPort(b.String())
-	return ah == bh
+	if port == remote.Port {
+		return true
+	}
+	return port == int(u.prevPort.Load()) && time.Now().UnixNano() < u.prevUntil.Load()
+}
+
+// hostPort extracts the IP and port of a datagram source. A custom
+// PacketConn may report a non-UDPAddr (or nil) source.
+func hostPort(a net.Addr) (net.IP, int, bool) {
+	if ua, ok := a.(*net.UDPAddr); ok && ua != nil {
+		return ua.IP, ua.Port, true
+	}
+	if a == nil {
+		return nil, 0, false
+	}
+	h, p, err := net.SplitHostPort(a.String())
+	if err != nil {
+		return nil, 0, false
+	}
+	port, err := strconv.Atoi(p)
+	ip := net.ParseIP(h)
+	if err != nil || ip == nil {
+		return nil, 0, false
+	}
+	return ip, port, true
 }
