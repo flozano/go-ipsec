@@ -358,7 +358,7 @@ func TestTunnelOutboundSeq(t *testing.T) {
 
 // newBareClient builds a Client with just enough wiring (logger, tunnel, a
 // connless session) to drive netstack()/Close() without a live handshake.
-func newBareClient(t *testing.T, ip string) *Client {
+func newBareClient(t testing.TB, ip string) *Client {
 	t.Helper()
 	encrIR := bytes.Repeat([]byte{0x01}, 32)
 	integIR := bytes.Repeat([]byte{0x02}, 32)
