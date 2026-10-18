@@ -105,7 +105,31 @@ func (s *Session) ikeAuthPSK(ctx context.Context) error {
 	if err := firstNotifyError(resp); err != nil {
 		return err
 	}
+	if err := s.checkPSKResponderID(resp); err != nil {
+		return err
+	}
 	return s.handleFinalAuthResponse(resp, s.cfg.PSK)
+}
+
+// checkPSKResponderID requires the responder's IDr to equal the configured
+// RemoteID, when one is set. With a pre-shared key there is no certificate, so
+// IDr is all that names the gateway: without this check any responder holding
+// the key is accepted under whatever identity it presents.
+func (s *Session) checkPSKResponderID(resp ikemsg.Payloads) error {
+	want := s.cfg.RemoteID
+	if want.Type == 0 && len(want.Data) == 0 {
+		return nil
+	}
+	for _, p := range resp {
+		if idr, ok := p.(*ikemsg.IDrPayload); ok {
+			if uint8(idr.IDType) != want.Type || !bytes.Equal(idr.Data, want.Data) {
+				return fmt.Errorf("session: responder identity (type %d, %q) does not match the configured remote ID (type %d, %q)",
+					idr.IDType, idr.Data, want.Type, want.Data)
+			}
+			return nil
+		}
+	}
+	return errors.New("session: IKE_AUTH response missing IDr")
 }
 
 // ikeAuthEAP runs the full IKE_AUTH exchange with EAP-MSCHAPv2 and installs the
