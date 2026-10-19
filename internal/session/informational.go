@@ -638,7 +638,10 @@ func (s *Session) sendGracefulDelete() {
 			return
 		}
 	}
-	s.log.Warn("the peer did not answer the IKE SA DELETE; it keeps the SA until its liveness check fails")
+	// Either our DELETEs were lost, or the peer deleted the SA on the first
+	// one and its answer was lost (it ignores the copies that follow, as the
+	// SA is gone): from here the two look the same.
+	s.log.Info("no answer to the IKE SA DELETE: the peer deleted the SA, or keeps it until its liveness check fails")
 }
 
 // --- timing helpers ---
