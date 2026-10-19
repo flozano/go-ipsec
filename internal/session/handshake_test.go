@@ -137,6 +137,28 @@ type responderResult struct {
 	err               error
 	childResponderSPI uint32
 	childKeys         ikesa.ChildKeys
+	rs                *Session // the responder's side, to decode later messages
+}
+
+// recvRejection reads the client's message after it refused IKE_AUTH and
+// returns its payloads, checking it is the INFORMATIONAL request that follows.
+func recvRejection(t *testing.T, conn transport.Conn, rs *Session) ikemsg.Payloads {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	raw, err := conn.Recv(ctx)
+	if err != nil {
+		t.Fatalf("no message after the refused IKE_AUTH: %v", err)
+	}
+	hdr, inner, err := rs.decodeSK(raw)
+	if err != nil {
+		t.Fatalf("decode the message after IKE_AUTH: %v", err)
+	}
+	if hdr.Exchange != ikemsg.ExchangeInformational || hdr.Flags.IsResponse() || hdr.MessageID != 2 {
+		t.Fatalf("got exchange %d response=%v ID %d, want an INFORMATIONAL request with ID 2",
+			hdr.Exchange, hdr.Flags.IsResponse(), hdr.MessageID)
+	}
+	return inner
 }
 
 // runResponder implements the responder half of the handshake, narrowing the
@@ -507,6 +529,7 @@ func runResponderPSK(conn transport.Conn, psk []byte, suite espSuite, mangle fun
 	fail := func(err error) *responderResult { res.err = err; return res }
 
 	rs := New(Config{Logger: slog.New(slog.DiscardHandler)})
+	res.rs = rs
 	nr := bytes.Repeat([]byte{0x42}, 32)
 
 	raw1, realMessage2, ni, err := respondSAInit(ctx, conn, rs, nr, gcmIKESuite())
@@ -632,7 +655,15 @@ func TestOfflineHandshakePSKDisabledSuiteRejected(t *testing.T) {
 	if initSess.Established() {
 		t.Fatal("session must not be established")
 	}
-	<-respDone
+	res := <-respDone
+	// The responder established the IKE SA; the client deletes it.
+	inner := recvRejection(t, respConn, res.rs)
+	if len(inner) != 1 {
+		t.Fatalf("got %d payloads, want one DELETE", len(inner))
+	}
+	if d, ok := inner[0].(*ikemsg.DeletePayload); !ok || d.Protocol != ikemsg.ProtocolIKE {
+		t.Fatalf("got %#v, want a DELETE of the IKE SA", inner[0])
+	}
 }
 
 // TestOfflineHandshakePSKAmbiguousSelectionRejected: the responder echoes a

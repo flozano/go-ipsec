@@ -105,9 +105,14 @@ func (s *Session) ikeAuthPSK(ctx context.Context) error {
 		return err
 	}
 	if err := s.checkPSKResponderID(resp); err != nil {
+		s.rejectIKEAuth(err)
 		return err
 	}
-	return s.handleFinalAuthResponse(resp, s.cfg.PSK)
+	if err := s.handleFinalAuthResponse(resp, s.cfg.PSK); err != nil {
+		s.rejectIKEAuth(err)
+		return err
+	}
+	return nil
 }
 
 // checkPSKResponderID requires the responder's IDr to equal the configured
@@ -122,13 +127,47 @@ func (s *Session) checkPSKResponderID(resp ikemsg.Payloads) error {
 	for _, p := range resp {
 		if idr, ok := p.(*ikemsg.IDrPayload); ok {
 			if uint8(idr.IDType) != want.Type || !bytes.Equal(idr.Data, want.Data) {
-				return fmt.Errorf("session: responder identity (type %d, %q) does not match the configured remote ID (type %d, %q)",
-					idr.IDType, idr.Data, want.Type, want.Data)
+				return responderAuthError{fmt.Errorf("session: responder identity (type %d, %q) does not match the configured remote ID (type %d, %q)",
+					idr.IDType, idr.Data, want.Type, want.Data)}
 			}
 			return nil
 		}
 	}
-	return errors.New("session: IKE_AUTH response missing IDr")
+	return responderAuthError{errors.New("session: IKE_AUTH response missing IDr")}
+}
+
+// responderAuthError marks a failure to authenticate the responder in its
+// IKE_AUTH response.
+type responderAuthError struct{ error }
+
+func (e responderAuthError) Unwrap() error { return e.error }
+
+// rejectIKEAuth tells the responder that we refused its final IKE_AUTH
+// response. It has established the IKE SA, a Child SA and perhaps an address
+// lease, and would otherwise hold them until its liveness checks give up.
+// Failing to authenticate it is reported with AUTHENTICATION_FAILED, any other
+// refusal deletes the IKE SA (RFC 7296 2.21.2). An error notify from the
+// responder means it established nothing, so nothing is sent. Best-effort:
+// one datagram, no reply awaited.
+func (s *Session) rejectIKEAuth(cause error) {
+	var notify *NotifyError
+	if errors.As(cause, &notify) || s.ikeSA == nil || s.conn == nil {
+		return
+	}
+	inner := ikemsg.Payloads{&ikemsg.DeletePayload{Protocol: ikemsg.ProtocolIKE}}
+	if errors.As(cause, new(responderAuthError)) {
+		inner = ikemsg.Payloads{&ikemsg.NotifyPayload{Type: ikemsg.NotifyAuthenticationFailed}}
+	}
+	raw, err := s.encodeSK(ikemsg.ExchangeInformational, ikeRoleBit(s.ikeSA.Role), s.messageID, inner)
+	if err != nil {
+		return
+	}
+	s.messageID++
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := s.sendDatagram(ctx, raw); err != nil {
+		s.log.Debug("IKE_AUTH rejection send failed", "err", err)
+	}
 }
 
 // ikeAuthEAP runs the full IKE_AUTH exchange with EAP-MSCHAPv2 and installs the
@@ -235,7 +274,11 @@ func (s *Session) ikeAuthEAP(ctx context.Context) error {
 	}
 	s.messageID++
 
-	return s.handleFinalAuthResponse(finalResp, msk)
+	if err := s.handleFinalAuthResponse(finalResp, msk); err != nil {
+		s.rejectIKEAuth(err)
+		return err
+	}
+	return nil
 }
 
 // handleAuthResponse processes message 4: cert chain, responder cert AUTH, and
@@ -321,20 +364,20 @@ func (s *Session) handleFinalAuthResponse(payloads ikemsg.Payloads, secret []byt
 		}
 	}
 	if authP == nil {
-		return errors.New("session: final IKE_AUTH missing responder AUTH")
+		return responderAuthError{errors.New("session: final IKE_AUTH missing responder AUTH")}
 	}
 	// EAP set s.remoteIDr from message 4; PSK carries IDr in this response.
 	if idr != nil {
 		s.remoteIDr = WireID{Type: uint8(idr.IDType), Data: append([]byte(nil), idr.Data...)}
 	}
 	if s.remoteIDr.Type == 0 && len(s.remoteIDr.Data) == 0 {
-		return errors.New("session: IKE_AUTH response missing IDr")
+		return responderAuthError{errors.New("session: IKE_AUTH response missing IDr")}
 	}
 	// Verify the responder's shared-secret AUTH over the responder signed octets.
 	respSigned := s.responderSignedOctets(ikemsg.MarshalIDBody(ikemsg.IDType(s.remoteIDr.Type), s.remoteIDr.Data))
 	want := auth.SharedSecretAuth(s.ikeSA.PRF, secret, respSigned)
 	if authP.Method != auth.MethodSharedKeyMIC || !constTimeEqual(authP.Data, want) {
-		return errors.New("session: responder AUTH verification failed")
+		return responderAuthError{errors.New("session: responder AUTH verification failed")}
 	}
 
 	if saP == nil || len(saP.Proposals) == 0 {
