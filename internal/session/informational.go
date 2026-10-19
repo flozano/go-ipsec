@@ -593,24 +593,52 @@ func (s *Session) clearPending(msgID uint32) {
 	}
 }
 
-// sendGracefulDelete sends INFORMATIONAL{ Delete(IKE SA) } on shutdown with a
-// short bounded timeout, best-effort.
+// gracefulDeleteWaits are how long sendGracefulDelete waits for the peer's
+// response after each transmission of the DELETE: it sends at 0, 0.5 and 1 s
+// and gives up at 2 s. Session.deleteWaits overrides it (tests).
+var gracefulDeleteWaits = []time.Duration{500 * time.Millisecond, 500 * time.Millisecond, time.Second}
+
+// sendGracefulDelete sends INFORMATIONAL{ Delete(IKE SA) } on shutdown and
+// waits for the peer's response, retransmitting on a short schedule: a lost
+// DELETE would leave the peer holding the SA until its liveness checks give
+// up. Best-effort and bounded (see gracefulDeleteWaits).
 func (s *Session) sendGracefulDelete() {
 	if s.ikeSA == nil || s.conn == nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
 	inner := ikemsg.Payloads{&ikemsg.DeletePayload{Protocol: ikemsg.ProtocolIKE}}
-	raw, err := s.encodeSK(ikemsg.ExchangeInformational, ikeRoleBit(s.ikeSA.Role), s.messageID, inner)
+	msgID := s.messageID
+	raw, err := s.encodeSK(ikemsg.ExchangeInformational, ikeRoleBit(s.ikeSA.Role), msgID, inner)
 	if err != nil {
 		return
 	}
 	s.messageID++
-	if err := s.sendDatagram(ctx, raw); err != nil {
-		s.log.Debug("graceful DELETE send failed", "err", err)
+	authentic := func(raw []byte, _ *ikemsg.Message) error {
+		_, _, _, err := decodeSKWith(s.ikeSA, raw)
+		return err
 	}
+	waits := gracefulDeleteWaits
+	if s.deleteWaits != nil {
+		waits = s.deleteWaits
+	}
+	for _, wait := range waits {
+		ctx, cancel := context.WithTimeout(context.Background(), wait)
+		err := s.sendDatagram(ctx, raw)
+		if err == nil {
+			_, _, err = s.recvMatching(ctx, ikemsg.ExchangeInformational, msgID, authentic)
+		}
+		timedOut := ctx.Err() != nil
+		cancel()
+		if err == nil {
+			s.log.Info("IKE SA deleted")
+			return
+		}
+		if !timedOut {
+			s.log.Debug("graceful DELETE failed", "err", err)
+			return
+		}
+	}
+	s.log.Warn("the peer did not answer the IKE SA DELETE; it keeps the SA until its liveness check fails")
 }
 
 // --- timing helpers ---

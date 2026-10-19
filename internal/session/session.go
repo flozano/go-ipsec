@@ -174,6 +174,9 @@ type Session struct {
 	// our own Child rekeys offer, so we mirror the group the server requires.
 	childPFSGroup uint16
 
+	// deleteWaits, if set, replaces gracefulDeleteWaits.
+	deleteWaits []time.Duration
+
 	// Responder-side retransmit handling for server-initiated exchanges. IKEv2
 	// requires a responder to cache its response and resend it on a duplicate
 	// request rather than reprocessing — reprocessing re-derives keys and

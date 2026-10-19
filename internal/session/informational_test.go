@@ -536,32 +536,79 @@ func TestReestablishClearsStaleFlagOnImmediateSuccess(t *testing.T) {
 	}
 }
 
+// recvGracefulDelete reads the next datagram on conn and checks that it is
+// the initiator's DELETE of the IKE SA, returning its Message ID.
+func recvGracefulDelete(t *testing.T, respS *Session, conn transport.Conn, within time.Duration) uint32 {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), within)
+	defer cancel()
+	raw, err := conn.Recv(ctx)
+	if err != nil {
+		t.Fatalf("no graceful DELETE: %v", err)
+	}
+	hdr, inner, err := respS.decodeSK(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range inner {
+		if dp, ok := p.(*ikemsg.DeletePayload); ok && dp.Protocol == ikemsg.ProtocolIKE {
+			return hdr.MessageID
+		}
+	}
+	t.Fatal("graceful shutdown did not send a Delete payload")
+	return 0
+}
+
+// Cancelling the driver context sends a DELETE of the IKE SA; once the peer
+// answers, the driver is done.
 func TestDriverGracefulDelete(t *testing.T) {
 	initS, respS, respConn := mirrorSessions(t)
 	inbox := make(chan []byte, 4)
 	ctx, cancel := context.WithCancel(context.Background())
-	go initS.Driver(ctx, inbox, func() {})
+	done := make(chan struct{})
+	go func() { initS.Driver(ctx, inbox, func() {}); close(done) }()
 
-	// Cancelling the driver context triggers a graceful DELETE.
 	cancel()
-	rctx, rcancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer rcancel()
-	raw, err := respConn.Recv(rctx)
-	if err != nil {
-		t.Fatalf("no graceful DELETE: %v", err)
-	}
-	_, inner, err := respS.decodeSK(raw)
+	msgID := recvGracefulDelete(t, respS, respConn, 2*time.Second)
+	resp, err := respS.encodeSK(ikemsg.ExchangeInformational, ikemsg.FlagResponse, msgID, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var sawDelete bool
-	for _, p := range inner {
-		if dp, ok := p.(*ikemsg.DeletePayload); ok && dp.Protocol == ikemsg.ProtocolIKE {
-			sawDelete = true
+	if err := respConn.Send(context.Background(), resp); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	case <-time.After(400 * time.Millisecond):
+		t.Fatal("the driver kept waiting after the DELETE was answered")
+	}
+	rctx, rcancel := context.WithTimeout(context.Background(), 700*time.Millisecond)
+	defer rcancel()
+	if _, err := respConn.Recv(rctx); err == nil {
+		t.Fatal("the DELETE was retransmitted after it was answered")
+	}
+}
+
+// An unanswered DELETE is retransmitted on schedule, then the driver gives up.
+func TestDriverGracefulDeleteRetransmits(t *testing.T) {
+	initS, respS, respConn := mirrorSessions(t)
+	initS.deleteWaits = []time.Duration{50 * time.Millisecond, 50 * time.Millisecond, 100 * time.Millisecond}
+	inbox := make(chan []byte, 4)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { initS.Driver(ctx, inbox, func() {}); close(done) }()
+
+	cancel()
+	first := recvGracefulDelete(t, respS, respConn, 2*time.Second)
+	for i := range 2 {
+		if id := recvGracefulDelete(t, respS, respConn, time.Second); id != first {
+			t.Fatalf("retransmission %d has Message ID %d, want %d", i+1, id, first)
 		}
 	}
-	if !sawDelete {
-		t.Fatal("graceful shutdown did not send a Delete payload")
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("the driver did not give up on the unanswered DELETE")
 	}
 }
 
